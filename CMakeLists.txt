@@ -29,10 +29,10 @@ set(ignoreMe "${VLLM_PYTHON_PATH}")
 install(CODE "set(CMAKE_INSTALL_LOCAL_ONLY TRUE)" ALL_COMPONENTS)
 
 #
-# Supported python versions.  These versions will be searched in order, the
-# first match will be selected.  These should be kept in sync with setup.py.
+# Supported python versions. These versions will be searched in order, the
+# first match will be selected. These should be kept in sync with setup.py.
 #
-set(PYTHON_SUPPORTED_VERSIONS "3.9" "3.10" "3.11" "3.12")
+set(PYTHON_SUPPORTED_VERSIONS "3.9" "3.10" "3.11" "3.12" "3.13")
 
 # Supported Intel GPU architectures.
 set(SYCL_SUPPORTED_ARCHS "intel_gpu_pvc;intel_gpu_bmg_g21")

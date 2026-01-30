@@ -12,32 +12,22 @@ if(NOT ONEDNN_FOUND)
   set(ONEDNN_INCLUDE_DIR)
   set(DNNL_INCLUDES)
 
-  set(THIRD_PARTY_DIR "${PROJECT_SOURCE_DIR}/third_party")
-  set(ONEDNN_DIR "oneDNN")
-  set(ONEDNN_ROOT "${THIRD_PARTY_DIR}/${ONEDNN_DIR}")
+  # Hardcode oneDNN root (source tree).
+  # NOTE: This module expects a oneDNN *source* checkout (it uses add_subdirectory()).
+  set(ONEDNN_ROOT "/home/josephku/oneDNN" CACHE PATH "Path to oneDNN source tree" FORCE)
+  message(STATUS "oneDNN: ONEDNN_ROOT='${ONEDNN_ROOT}'")
 
   find_path(
-    ONEDNN_INCLUDE_DIR dnnl.hpp dnnl.h
+    ONEDNN_INCLUDE_DIR
+    NAMES oneapi/dnnl/dnnl.h oneapi/dnnl/dnnl.hpp dnnl.h dnnl.hpp
     PATHS ${ONEDNN_ROOT}
     PATH_SUFFIXES include
     NO_DEFAULT_PATH)
-  if(NOT ONEDNN_INCLUDE_DIR)
-    find_package(Git)
-    if(NOT Git_FOUND)
-      message(FATAL_ERROR "Can not find Git executable!")
-    endif()
-    execute_process(
-      COMMAND ${GIT_EXECUTABLE} submodule update --init ${ONEDNN_DIR}
-      WORKING_DIRECTORY ${THIRD_PARTY_DIR} COMMAND_ERROR_IS_FATAL ANY)
-    find_path(
-      ONEDNN_INCLUDE_DIR dnnl.hpp dnnl.h
-      PATHS ${ONEDNN_ROOT}
-      PATH_SUFFIXES include
-      NO_DEFAULT_PATH)
-  endif(NOT ONEDNN_INCLUDE_DIR)
 
   if(NOT ONEDNN_INCLUDE_DIR)
-    message(FATAL_ERROR "oneDNN source files not found!")
+    message(
+      FATAL_ERROR
+        "oneDNN source files not found at '${ONEDNN_ROOT}'. Expected headers under '${ONEDNN_ROOT}/include'.")
   endif(NOT ONEDNN_INCLUDE_DIR)
 
   set(DNNL_ENABLE_PRIMITIVE_CACHE
@@ -48,24 +38,13 @@ if(NOT ONEDNN_FOUND)
       STATIC
       CACHE STRING "" FORCE)
 
-  set(DNNL_CPU_RUNTIME
-      "NONE"
-      CACHE STRING "oneDNN cpu backend" FORCE)
-  set(DNNL_GPU_RUNTIME
-      "SYCL"
-      CACHE STRING "oneDNN gpu backend" FORCE)
-  set(DNNL_BUILD_TESTS
-      FALSE
-      CACHE BOOL "build with oneDNN tests" FORCE)
-  set(DNNL_BUILD_EXAMPLES
-      FALSE
-      CACHE BOOL "build with oneDNN examples" FORCE)
-  set(DNNL_ENABLE_CONCURRENT_EXEC
-      TRUE
-      CACHE BOOL "multi-thread primitive execution" FORCE)
-  set(DNNL_EXPERIMENTAL
-      TRUE
-      CACHE BOOL "use one pass for oneDNN BatchNorm" FORCE)
+  set(DNNL_CPU_RUNTIME "THREADPOOL" CACHE STRING "oneDNN cpu backend" FORCE)
+  set(DNNL_GPU_RUNTIME "SYCL" CACHE STRING "oneDNN gpu backend" FORCE)
+  set(DNNL_BUILD_TESTS FALSE CACHE BOOL "build with oneDNN tests" FORCE)
+  set(DNNL_BUILD_EXAMPLES FALSE CACHE BOOL "build with oneDNN examples" FORCE)
+  set(DNNL_ENABLE_CONCURRENT_EXEC TRUE CACHE BOOL "multi-thread primitive execution" FORCE)
+  set(DNNL_EXPERIMENTAL TRUE CACHE BOOL "use one pass for oneDNN BatchNorm" FORCE)
+  set(DNNL_EXPERIMENTAL_GROUPED_GEMM ON CACHE BOOL "" FORCE)
 
   add_subdirectory(${ONEDNN_ROOT} oneDNN EXCLUDE_FROM_ALL)
   set(ONEDNN_LIBRARY ${DNNL_LIBRARY_NAME})
@@ -84,8 +63,7 @@ if(NOT ONEDNN_FOUND)
   list(APPEND ONEDNN_INCLUDE_DIR ${DNNL_INCLUDES})
 
   # Upper level targets should not load header files from oneDNN's third party.
-  list(FILTER ONEDNN_INCLUDE_DIR EXCLUDE REGEX
-       ".*third_party/oneDNN/third_party.*")
+  list(FILTER ONEDNN_INCLUDE_DIR EXCLUDE REGEX ".*${ONEDNN_ROOT}/third_party.*")
 
   set(ONEDNN_FOUND ON)
   message(STATUS "Found oneDNN: TRUE")

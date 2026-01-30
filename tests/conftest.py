@@ -3,6 +3,12 @@ import os
 
 import pytest
 
+# Hard requirement for XPU kernel tests: pin Level Zero to a known device.
+#
+# NOTE: This must be set early (before any XPU runtime initialization), so we
+# set it at import time in the pytest harness.
+os.environ["ZE_AFFINITY_MASK"] = "4"
+
 
 def pytest_generate_tests(metafunc):
     use_mini_pytest_profiler = os.getenv("XPU_KERNEL_PYTEST_PROFILER",
