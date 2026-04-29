@@ -34,7 +34,7 @@ install(CODE "set(CMAKE_INSTALL_LOCAL_ONLY TRUE)" ALL_COMPONENTS)
 set(PYTHON_SUPPORTED_VERSIONS "3.9" "3.10" "3.11" "3.12")
 
 # Supported Intel GPU architectures.
-set(SYCL_SUPPORTED_ARCHS "intel_gpu_pvc;intel_gpu_bmg_g21;intel_gpu_bmg_g31")
+set(SYCL_SUPPORTED_ARCHS "intel_gpu_bmg_g21;intel_gpu_bmg_g31")
 
 #
 # Supported/expected torch versions for XPU.
@@ -176,8 +176,8 @@ if(VLLM_GPU_LANG STREQUAL "SYCL")
   # VLLM_XPU_AOT_DEVICES and VLLM_XPU_XE2_AOT_DEVICES Example: export
   # VLLM_XPU_AOT_DEVICES="pvc,bmg-g21-a0" export
   # VLLM_XPU_XE2_AOT_DEVICES="pvc,bmg-g31-a0"
-  set(AOT_DEVICES "pvc,bmg,bmg-g21-a0,bmg-g31-a0")
-  set(XE2_AOT_DEVICES "pvc,bmg,bmg-g21-a0,bmg-g31-a0")
+  set(AOT_DEVICES "bmg,bmg-g21-a0,bmg-g31-a0")
+  set(XE2_AOT_DEVICES "bmg,bmg-g21-a0,bmg-g31-a0")
 
   # Allow overriding via env, including explicitly disabling AOT by setting an
   # empty env var (e.g. export VLLM_XPU_AOT_DEVICES="").
@@ -539,12 +539,15 @@ if(XPU_SPECIFIC_KERNELS_ENABLED)
   # TODO: check if we need this flags list(APPEND VLLM_GPU_FLAGS
   # "-gline-tables-only")
 
+  set(VLLM_XPU_EXT_INCLUDE_DIRS ${VLLM_XPU_INCLUDE_DIR})
+  set(VLLM_XPU_EXT_LIBRARIES ${GROUPED_GEMM_LIB_NAME};${GDN_ATTN_LIB_NAME})
+
   if(ONEDNN_FOUND)
     set(_ONEDNN_SRC)
     file(GLOB _ONEDNN_SRC csrc/xpu/onednn/*.cpp)
     list(APPEND VLLM_EXT_XPU_SRC ${_ONEDNN_SRC})
-    include_directories(${ONEDNN_INCLUDE_DIR})
-    link_libraries(${ONEDNN_LIBRARY})
+    list(APPEND VLLM_XPU_EXT_INCLUDE_DIRS ${ONEDNN_INCLUDE_DIR})
+    list(APPEND VLLM_XPU_EXT_LIBRARIES ${ONEDNN_LIBRARY})
   else()
     message(
       FATAL_ERROR "onednn not found but xpu specific kernels are enabled.")
@@ -565,9 +568,9 @@ if(XPU_SPECIFIC_KERNELS_ENABLED)
     ARCHITECTURES
     ${VLLM_GPU_ARCHES}
     INCLUDE_DIRECTORIES
-    ${VLLM_XPU_INCLUDE_DIR}
+    ${VLLM_XPU_EXT_INCLUDE_DIRS}
     LIBRARIES
-    ${GROUPED_GEMM_LIB_NAME};${GDN_ATTN_LIB_NAME}
+    ${VLLM_XPU_EXT_LIBRARIES}
     USE_SABI
     3
     WITH_SOABI)
