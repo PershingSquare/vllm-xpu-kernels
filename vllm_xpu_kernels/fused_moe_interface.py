@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
+import os
 import torch
 
 try:
@@ -9,6 +10,67 @@ try:
 except ImportError as e:
     FUSEDMOE_UNAVAILABLE_REASON = str(e)
     FUSEDMOE_AVAILABLE = False
+
+
+def _onednn_grouped_gemm_debug_enabled() -> bool:
+    value = os.environ.get("VLLM_XPU_ONEDNN_GROUPED_GEMM_DEBUG", "")
+    return value.strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _shape_or_none(tensor: torch.Tensor | None):
+    if tensor is None:
+        return None
+    return tuple(int(v) for v in tensor.shape)
+
+
+def _scales_layout_hint(scales: torch.Tensor | None, expected_n: int):
+    if scales is None:
+        return "none"
+    if scales.dim() != 3:
+        return f"unexpected_dim_{scales.dim()}"
+
+    shape = tuple(int(v) for v in scales.shape)
+    if shape[1] == expected_n:
+        return "[E,N,G]"
+    if shape[2] == expected_n:
+        return "[E,G,N]"
+    return f"unknown(shape={shape}, expected_N={expected_n})"
+
+
+def _normalize_onednn_scales_layout(scales: torch.Tensor | None,
+                                    expected_n: int):
+    """Return scales in canonical [E, N, G] layout expected by C++ wrapper."""
+    if scales is None:
+        return None
+    if scales.dim() != 3:
+        return scales
+    if int(scales.shape[1]) == int(expected_n):
+        return scales
+    if int(scales.shape[2]) == int(expected_n):
+        return scales.permute(0, 2, 1).contiguous()
+    return scales
+
+
+def _use_w4a8() -> bool:
+    return os.environ.get("VLLM_XPU_USE_W4A8", "0") == "1"
+
+
+def _dynamic_per_token_quant_int8(x: torch.Tensor):
+    """Per-token asymmetric uint8 quantization. scale=(max-min)/255, zp=round(-min/scale), output in [0,255]."""
+    flat = x.reshape(-1, x.shape[-1])
+    min_val = flat.to(torch.float32).min(dim=-1)[0].unsqueeze(-1)
+    max_val = flat.to(torch.float32).max(dim=-1)[0].unsqueeze(-1)
+    scale = ((max_val - min_val) / 255.0).clamp(min=1e-10)
+    zero_point = torch.clamp(torch.round(-min_val / scale), 0, 255).to(torch.uint8)
+    quantized = torch.clamp(
+        torch.round(flat.to(torch.float32) / scale + zero_point.to(torch.float32)),
+        0, 255,
+    ).to(torch.uint8)
+    return (
+        quantized.reshape(x.shape),
+        scale.reshape(x.shape[:-1] + (1,)).to(x.dtype),
+        zero_point.reshape(x.shape[:-1] + (1,)),
+    )
 
 
 def cutlass_grouped_gemm(input_A, input_B, bias, output, expert_token_count, n,
@@ -28,7 +90,7 @@ def cutlass_grouped_gemm(input_A, input_B, bias, output, expert_token_count, n,
     expert_offset = torch.tensor(exclusive_prefix_sum(expert_token_count),
                                  dtype=torch.int64,
                                  device="xpu")
-    torch.ops._xpu_C.cutlass_grouped_gemm_interface(
+    torch.ops._xpu_C.grouped_gemm_interface(
         ptr_A=input_A,
         ptr_B=input_B,
         ptr_scales=None,
@@ -51,7 +113,7 @@ def cutlass_grouped_gemm_xe2(input_A, input_B, scales, bias, output,
                      device=num_rows_per_expert.device),
         torch.cumsum(num_rows_per_expert, dim=0)
     ]).to(torch.int64)
-    torch.ops._xpu_C.cutlass_grouped_gemm_interface(
+    torch.ops._xpu_C.grouped_gemm_interface(
         ptr_A=input_A,
         ptr_B=input_B,
         ptr_scales=scales,
@@ -108,6 +170,11 @@ def implement_zp(qweight):
     return result
 
 
+def implement_zp_xor88(qweight):
+    assert qweight.dtype == torch.uint8, "Input tensor must be uint8"
+    return qweight ^ 0x88
+
+
 def xpu_fused_moe(hidden_states,
                   w13,
                   w13_scales,
@@ -155,8 +222,11 @@ def xpu_fused_moe(hidden_states,
         assert output.shape == hidden_states.shape, \
             "output shape must be the same as hidden_states shape"
 
-    # 4bits support [E, N, K]
-    # other types [E, K, N]
+    backend = os.environ.get("VLLM_XPU_GROUPED_GEMM_BACKEND", "").strip().lower()
+    onednn_debug = _onednn_grouped_gemm_debug_enabled()
+    using_onednn_int4_backend = is_int4 and backend == "onednn"
+    using_w4a8 = using_onednn_int4_backend and _use_w4a8()
+
     if not is_int4 and not is_mxfp4:
         inter_size = list(w13.shape)[-1] // 2
     else:
@@ -164,20 +234,30 @@ def xpu_fused_moe(hidden_states,
 
     assert w13.is_contiguous() and w2.is_contiguous()
 
-    # FIXME: move this to vllm
+    hidden_size = int(hidden_states.shape[1])
     if is_int4 and not hasattr(w13, 'xpu_fused_moe'):
-        w13_tmp = torch.empty_like(w13)
-        w2_tmp = torch.empty_like(w2)
-        for i in range(num_experts):
-            w13_tmp[i] = implement_zp(w13[i])
-            w2_tmp[i] = implement_zp(w2[i])
-        w13_tmp = w13_tmp.contiguous()
-        w2_tmp = w2_tmp.contiguous()
-        w13.data = w13_tmp
-        w2.data = w2_tmp
+        if backend == "onednn":
+            if onednn_debug:
+                print(
+                    "[vllm_xpu_kernels][onednn][xpu_fused_moe] int4 prepack "
+                    f"w13={_shape_or_none(w13)}, w13_scales={_shape_or_none(w13_scales)}, "
+                    f"w2={_shape_or_none(w2)}, w2_scales={_shape_or_none(w2_scales)}, "
+                    f"w13_scales_layout={_scales_layout_hint(w13_scales, 2 * inter_size)}, "
+                    f"w2_scales_layout={_scales_layout_hint(w2_scales, hidden_size)}",
+                    flush=True,
+                )
+        else:
+            w13_tmp = torch.empty_like(w13)
+            w2_tmp = torch.empty_like(w2)
+            for i in range(num_experts):
+                w13_tmp[i] = implement_zp(w13[i])
+                w2_tmp[i] = implement_zp(w2[i])
+            w13_tmp = w13_tmp.contiguous()
+            w2_tmp = w2_tmp.contiguous()
+            w13.data = w13_tmp
+            w2.data = w2_tmp
         w13.xpu_fused_moe = True
 
-    # TODO: will all integrated in Cpp func. Temporary expose before gemm fusion
     num_rows, hidden_size = list(hidden_states.shape)
     num_moe_inputs = n_experts_per_token * num_rows
     if topk_ids.dtype == torch.int32:
@@ -230,21 +310,39 @@ def xpu_fused_moe(hidden_states,
         total_experts_num=total_experts_num,
         local_experts_num=local_experts_num)
 
+    if using_onednn_int4_backend:
+        gemm1_scales = _normalize_onednn_scales_layout(gemm1_scales,
+                                                       2 * inter_size)
+        gemm2_scales = _normalize_onednn_scales_layout(gemm2_scales,
+                                                       hidden_size)
+
     ########### gemm1 ##################
     input_B = w13
 
-    torch.ops._xpu_C.cutlass_grouped_gemm_interface(
-        ptr_A=remapped_hidden_states,
-        ptr_B=input_B,
-        ptr_scales=gemm1_scales,
-        ptr_bias=w13_bias,
-        ptr_D=gemm1_output,
-        expert_first_token_offset=expert_first_token_offset,
-        N=2 * inter_size,
-        K=hidden_size,
-        num_experts=num_experts,
-        is_B_int4=is_int4,
-        is_B_mxfp4=is_mxfp4)
+    if using_w4a8:
+        A_q, A_scale, A_zp = _dynamic_per_token_quant_int8(
+            remapped_hidden_states)
+        A_scale_flat = A_scale.reshape(-1).to(torch.float32)
+        A_zp_flat = A_zp.reshape(-1)
+        B_scales_f32 = gemm1_scales.to(torch.float32) if gemm1_scales is not None else None
+        torch.ops._xpu_C.onednn_grouped_gemm_w4a8(
+            A_q, A_scale_flat, A_zp_flat,
+            input_B, B_scales_f32, w13_bias,
+            gemm1_output, expert_first_token_offset,
+            2 * inter_size, hidden_size, num_experts)
+    else:
+        torch.ops._xpu_C.grouped_gemm_interface(
+            ptr_A=remapped_hidden_states,
+            ptr_B=input_B,
+            ptr_scales=gemm1_scales,
+            ptr_bias=w13_bias,
+            ptr_D=gemm1_output,
+            expert_first_token_offset=expert_first_token_offset,
+            N=2 * inter_size,
+            K=hidden_size,
+            num_experts=num_experts,
+            is_B_int4=is_int4,
+            is_B_mxfp4=is_mxfp4)
 
     inter_size_scale = 2 if activation == "relu2_no_mul" else 1
     # act
@@ -268,21 +366,32 @@ def xpu_fused_moe(hidden_states,
     input_A = act_output.contiguous()
     input_B = w2
     gemm2_output = torch.empty((num_moe_inputs, hidden_size),
-                               dtype=hidden_states.dtype,
-                               device=hidden_states.device)
+                                dtype=hidden_states.dtype,
+                                device=hidden_states.device)
 
-    torch.ops._xpu_C.cutlass_grouped_gemm_interface(
-        ptr_A=input_A,
-        ptr_B=input_B,
-        ptr_scales=gemm2_scales,
-        ptr_bias=w2_bias,
-        ptr_D=gemm2_output,
-        expert_first_token_offset=expert_first_token_offset,
-        N=hidden_size,
-        K=inter_size * inter_size_scale,
-        num_experts=num_experts,
-        is_B_int4=is_int4,
-        is_B_mxfp4=is_mxfp4)
+    if using_w4a8:
+        A_q2, A_scale2, A_zp2 = _dynamic_per_token_quant_int8(input_A)
+        A_scale2_flat = A_scale2.reshape(-1).to(torch.float32)
+        A_zp2_flat = A_zp2.reshape(-1)
+        B_scales2_f32 = gemm2_scales.to(torch.float32) if gemm2_scales is not None else None
+        torch.ops._xpu_C.onednn_grouped_gemm_w4a8(
+            A_q2, A_scale2_flat, A_zp2_flat,
+            input_B, B_scales2_f32, w2_bias,
+            gemm2_output, expert_first_token_offset,
+            hidden_size, inter_size * inter_size_scale, num_experts)
+    else:
+        torch.ops._xpu_C.grouped_gemm_interface(
+            ptr_A=input_A,
+            ptr_B=input_B,
+            ptr_scales=gemm2_scales,
+            ptr_bias=w2_bias,
+            ptr_D=gemm2_output,
+            expert_first_token_offset=expert_first_token_offset,
+            N=hidden_size,
+            K=inter_size * inter_size_scale,
+            num_experts=num_experts,
+            is_B_int4=is_int4,
+            is_B_mxfp4=is_mxfp4)
 
     torch.ops._moe_C.moe_gather(output, gemm2_output, topk_weights,
                                 unpermuted_row_to_permuted_row,
