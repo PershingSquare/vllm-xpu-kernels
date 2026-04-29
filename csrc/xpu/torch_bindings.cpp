@@ -1,9 +1,9 @@
 #include "core/registration.h"
 #include "xpu/ops.h"
-#ifdef VLLM_MOE_ENABLED
-  #include "xpu/grouped_gemm/grouped_gemm_interface.h"
-#endif
+#include "xpu/grouped_gemm/grouped_gemm_interface.h"
 #include "xpu/lora/lora_ops.h"
+#include "xpu/onednn/grouped_gemm_w4a16.h"
+#include "xpu/onednn/grouped_gemm_w4a8.h"
 
 #include <torch/library.h>
 #include <torch/version.h>
@@ -37,7 +37,17 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, xpu_ops) {
       "bias) -> Tensor");
   xpu_ops.impl("int4_gemm_w4a8", torch::kXPU, &int4_gemm_w4a8);
 
-#ifdef VLLM_MOE_ENABLED
+  xpu_ops.def(
+      "grouped_gemm_interface(Tensor ptr_A, Tensor ptr_B, Tensor? ptr_scales, "
+      "Tensor? ptr_bias, "
+      "Tensor "
+      "ptr_D, Tensor "
+      "expert_first_token_offset, int N, int K, int "
+      "num_experts, bool is_B_int4, bool is_B_mxfp4) -> "
+      "Tensor");
+  xpu_ops.impl("grouped_gemm_interface", torch::kXPU, &grouped_gemm_interface);
+
+  // Legacy alias kept for compatibility with existing callers.
   xpu_ops.def(
       "cutlass_grouped_gemm_interface(Tensor ptr_A, Tensor ptr_B, Tensor? "
       "ptr_scales, "
@@ -48,10 +58,26 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, xpu_ops) {
       "num_experts, bool is_B_int4, bool is_B_mxfp4) -> "
       "Tensor");
   xpu_ops.impl(
-      "cutlass_grouped_gemm_interface",
-      torch::kXPU,
-      &cutlass_grouped_gemm_interface);
-#endif
+      "cutlass_grouped_gemm_interface", torch::kXPU, &grouped_gemm_interface);
+
+  // oneDNN grouped GEMM direct bindings
+  xpu_ops.def(
+      "onednn_grouped_gemm_w4a16(Tensor ptr_A, Tensor ptr_B, Tensor? "
+      "ptr_scales, "
+      "Tensor? ptr_bias, Tensor ptr_D, Tensor expert_first_token_offset, "
+      "int N, int K, int num_experts, bool is_B_int4, bool is_B_mxfp4) -> "
+      "Tensor");
+  xpu_ops.impl(
+      "onednn_grouped_gemm_w4a16", torch::kXPU, &oneDNN::grouped_gemm_w4a16);
+
+  xpu_ops.def(
+      "onednn_grouped_gemm_w4a8(Tensor A_q, Tensor A_scale, Tensor A_zp, "
+      "Tensor B_packed_s4, "
+      "Tensor B_scales, Tensor? bias, Tensor D, Tensor "
+      "expert_first_token_offset, "
+      "int N, int K, int num_experts) -> Tensor");
+  xpu_ops.impl(
+      "onednn_grouped_gemm_w4a8", torch::kXPU, &oneDNN::grouped_gemm_w4a8);
 
   xpu_ops.def(
       "deepseek_scaling_rope(Tensor! positions, Tensor! query, Tensor! key, "

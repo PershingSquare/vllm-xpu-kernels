@@ -1,6 +1,6 @@
 #include <torch/all.h>
 
-torch::Tensor cutlass_grouped_gemm_interface(
+torch::Tensor grouped_gemm_interface(
     torch::Tensor ptr_A,
     torch::Tensor ptr_B,
     const c10::optional<at::Tensor>& ptr_scales,
