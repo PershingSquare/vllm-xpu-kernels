@@ -36,4 +36,21 @@ torch::Tensor grouped_gemm_w4a8_prepacked(
     int64_t K,
     int64_t num_experts);
 
+// v2: Zero-overhead hot-path. Caller pre-builds expert_ends_i32 and
+// max_group_size outside the timing loop, eliminating per-call allocations
+// and device→host syncs.
+torch::Tensor grouped_gemm_w4a8_prepacked_v2(
+    torch::Tensor A_q,
+    torch::Tensor A_scale,
+    torch::Tensor A_zp,
+    torch::Tensor B_s4,
+    torch::Tensor B_scales_permuted,
+    const c10::optional<at::Tensor>& bias,
+    torch::Tensor D,
+    torch::Tensor expert_ends_i32,
+    int64_t N,
+    int64_t K,
+    int64_t num_experts,
+    int64_t max_group_size);
+
 }  // namespace oneDNN

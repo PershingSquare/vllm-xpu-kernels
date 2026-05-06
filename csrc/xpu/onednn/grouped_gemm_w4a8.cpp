@@ -1009,16 +1009,15 @@ torch::Tensor grouped_gemm_w4a8_prepacked(
       args.emplace(DNNL_ARG_ATTR_SCALES | DNNL_ARG_SRC, src_scales_mem);
       args.emplace(DNNL_ARG_ATTR_ZERO_POINTS | DNNL_ARG_SRC, src_zp_mem);
       args.emplace(DNNL_ARG_ATTR_SCALES | DNNL_ARG_WEIGHTS, wei_scales_mem);
-      // Max group size hint for oneDNN grouped dispatch.
-      // grouped_micro_gemm dereferences this on the host before kernel launch,
-      // so it must be shared USM (host + device accessible).
-      auto sycl_queue = dnnl::sycl_interop::get_queue(stream);
-      int32_t* hint_usm = sycl::malloc_shared<int32_t>(1, sycl_queue);
-      hint_usm[0] = max_group_size_val;
+      if (iter->second.hint_usm == nullptr) {
+        auto sycl_queue = dnnl::sycl_interop::get_queue(stream);
+        iter->second.hint_usm = sycl::malloc_shared<int32_t>(1, sycl_queue);
+      }
+      iter->second.hint_usm[0] = max_group_size_val;
       auto hint_md = dnnl::memory::desc(
           {1}, dnnl::memory::data_type::s32, dnnl::memory::format_tag::a);
       auto hint_mem = dnnl::sycl_interop::make_memory(
-          hint_md, engine, dnnl::sycl_interop::memory_kind::usm, hint_usm);
+          hint_md, engine, dnnl::sycl_interop::memory_kind::usm, iter->second.hint_usm);
       args.emplace(DNNL_ARG_HINT_MAX_GROUP_SIZE, std::move(hint_mem));
       if (bias.has_value()) {
         const at::Tensor& b = *bias;
@@ -1028,7 +1027,6 @@ torch::Tensor grouped_gemm_w4a8_prepacked(
       }
 
       (void)dnnl::sycl_interop::execute(iter->second.prim, stream, args);
-      sycl::free(hint_usm, sycl_queue);
     } catch (const dnnl::error& e) {
       if (e.status == dnnl_unimplemented ||
           message_contains(e.what(), "unsupported scales configuration")) {
@@ -1087,6 +1085,220 @@ torch::Tensor grouped_gemm_w4a8_prepacked(
   };
 
   return run_int8(requested_dst_dt);
+#endif
+}
+
+torch::Tensor grouped_gemm_w4a8_prepacked_v2(
+    torch::Tensor A_q,
+    torch::Tensor A_scale,
+    torch::Tensor A_zp,
+    torch::Tensor B_s4,
+    torch::Tensor B_scales_permuted,
+    const c10::optional<at::Tensor>& bias,
+    torch::Tensor D,
+    torch::Tensor expert_ends_i32,
+    int64_t N,
+    int64_t K,
+    int64_t num_experts,
+    int64_t max_group_size) {
+#if !(                                           \
+    defined(DNNL_EXPERIMENTAL_GROUPED_MEMORY) && \
+    DNNL_EXPERIMENTAL_GROUPED_MEMORY) &&         \
+    !(defined(DNNL_EXPERIMENTAL_GROUPED_GEMM) && \
+      DNNL_EXPERIMENTAL_GROUPED_GEMM)
+  (void)A_q;
+  (void)A_scale;
+  (void)A_zp;
+  (void)B_s4;
+  (void)B_scales_permuted;
+  (void)bias;
+  (void)D;
+  (void)expert_ends_i32;
+  (void)N;
+  (void)K;
+  (void)num_experts;
+  (void)max_group_size;
+  TORCH_CHECK(
+      false,
+      "oneDNN grouped GEMM is not enabled in this build "
+      "(DNNL_EXPERIMENTAL_GROUPED_MEMORY=0 / "
+      "DNNL_EXPERIMENTAL_GROUPED_GEMM=0)");
+#else
+  const int64_t total_M = A_q.size(0);
+  const int64_t group_num = B_scales_permuted.size(1);
+  const int64_t group_size = K / group_num;
+  const int32_t max_group_size_val = static_cast<int32_t>(max_group_size);
+
+  const auto src_dt = dnnl::memory::data_type::u8;
+  const auto requested_dst_dt = to_onednn_type(D.scalar_type());
+  const auto src_scales_dt = to_onednn_type(A_scale.scalar_type());
+  const auto wei_scales_dt = to_onednn_type(B_scales_permuted.scalar_type());
+  const auto src_zp_dt = dnnl::memory::data_type::u8;
+
+  const dnnl::memory::dim ngroups = static_cast<dnnl::memory::dim>(num_experts);
+  auto src_md = dnnl::memory::desc::grouped(
+      {total_M, K},
+      src_dt,
+      /*variable_dim_idx=*/0,
+      /*group_count=*/ngroups,
+      /*offsets_dt=*/dnnl::memory::data_type::s32);
+  auto make_dst_md = [&](dnnl::memory::data_type dt) {
+    return dnnl::memory::desc::grouped(
+        {total_M, N},
+        dt,
+        /*variable_dim_idx=*/0,
+        /*group_count=*/ngroups,
+        /*offsets_dt=*/dnnl::memory::data_type::s32);
+  };
+
+  auto wei_md = dnnl::memory::desc(
+      {num_experts, K, N},
+      dnnl::memory::data_type::s4,
+      dnnl::memory::format_tag::acb);
+
+  const dnnl::memory::dim G = static_cast<dnnl::memory::dim>(group_num);
+  const dnnl::memory::dim NN = static_cast<dnnl::memory::dim>(N);
+  auto wei_scales_md = dnnl::memory::desc(
+      {num_experts, G, NN}, wei_scales_dt, dnnl::memory::format_tag::abc);
+
+  torch::Tensor src_scales_onednn = A_scale.reshape({total_M}).contiguous();
+  auto src_scales_md =
+      dnnl::memory::desc({total_M}, src_scales_dt, dnnl::memory::format_tag::a);
+  torch::Tensor src_zp_onednn = (A_zp.scalar_type() == at::ScalarType::Byte
+                                     ? A_zp
+                                     : A_zp.to(at::ScalarType::Byte))
+                                    .reshape({total_M})
+                                    .contiguous();
+  auto src_zp_md =
+      dnnl::memory::desc({total_M}, src_zp_dt, dnnl::memory::format_tag::a);
+
+  dnnl::memory::desc bias_md;
+  if (bias.has_value()) {
+    const at::Tensor& b = *bias;
+    bias_md = dnnl::memory::desc(
+        {num_experts, N},
+        to_onednn_type(b.scalar_type()),
+        {/*stride_e=*/N, /*stride_n=*/1});
+  }
+
+  dnnl::primitive_attr attr;
+  attr.set_scales(
+      DNNL_ARG_SRC,
+      /*mask=*/(1 << 0),
+      /*groups=*/{},
+      src_scales_dt);
+  attr.set_zero_points(
+      DNNL_ARG_SRC,
+      /*mask=*/(1 << 0),
+      /*groups=*/{},
+      src_zp_dt);
+  attr.set_scales(
+      DNNL_ARG_WEIGHTS,
+      /*mask=*/(1 << 0) | (1 << 1) | (1 << 2),
+      /*groups=*/{group_size, 1},
+      wei_scales_dt);
+
+  const at::Device cur_device = A_q.device();
+  const int device_id = cur_device.index();
+  auto& engine = oneDNN::GpuEngineManager::Instance().get_engine(cur_device);
+  auto& stream = oneDNN::GpuStreamManager::Instance().get_stream(device_id);
+
+  auto wei_mem =
+      oneDNN::make_onednn_memory(wei_md, engine, B_s4.data_ptr());
+  auto wei_scales_mem = oneDNN::make_onednn_memory(
+      wei_scales_md, engine, B_scales_permuted.data_ptr());
+  auto src_scales_mem = oneDNN::make_onednn_memory(
+      src_scales_md, engine, src_scales_onednn.data_ptr());
+  auto src_zp_mem =
+      oneDNN::make_onednn_memory(src_zp_md, engine, src_zp_onednn.data_ptr());
+
+  auto make_src_mem = [&]() {
+    return dnnl::sycl_interop::make_memory(
+        src_md,
+        engine,
+        dnnl::sycl_interop::memory_kind::usm,
+        std::vector<void*>{A_q.data_ptr(), expert_ends_i32.data_ptr()});
+  };
+
+  auto dst_dt = requested_dst_dt;
+  auto dst_md = make_dst_md(dst_dt);
+
+  grouped_gemm_primitive_key_t cache_key{};
+  cache_key.device_id = device_id;
+  cache_key.src_dtype = static_cast<int64_t>(src_dt);
+  cache_key.wei_dtype = static_cast<int64_t>(dnnl::memory::data_type::s4);
+  cache_key.dst_dtype = static_cast<int64_t>(dst_dt);
+  cache_key.src_scales_dtype = static_cast<int64_t>(src_scales_dt);
+  cache_key.wei_scales_dtype = static_cast<int64_t>(wei_scales_dt);
+  cache_key.bias_dtype =
+      bias.has_value()
+          ? static_cast<int64_t>(to_onednn_type(bias.value().scalar_type()))
+          : static_cast<int64_t>(dnnl::memory::data_type::undef);
+  cache_key.requested_dst_dtype = static_cast<int64_t>(requested_dst_dt);
+  cache_key.total_m = total_M;
+  cache_key.n = N;
+  cache_key.k = K;
+  cache_key.num_experts = num_experts;
+  cache_key.group_num = group_num;
+  cache_key.group_size = group_size;
+  cache_key.has_bias = bias.has_value() ? 1 : 0;
+
+  auto& primitive_cache = get_grouped_gemm_primitive_cache(device_id);
+  auto iter = primitive_cache.find(cache_key);
+  if (iter == primitive_cache.end()) {
+    dnnl::matmul::primitive_desc pd;
+    if (bias.has_value()) {
+      pd = dnnl::matmul::primitive_desc(
+          engine, src_md, wei_md, bias_md, dst_md, attr);
+    } else {
+      pd = dnnl::matmul::primitive_desc(
+          engine, src_md, wei_md, dst_md, attr);
+    }
+    dnnl::matmul prim(pd);
+    iter = primitive_cache
+               .insert(
+                   {cache_key,
+                    grouped_gemm_cached_primitive_t{
+                        std::move(pd), std::move(prim)}})
+               .first;
+  }
+
+  auto src_mem = make_src_mem();
+  auto dst_mem = dnnl::sycl_interop::make_memory(
+      dst_md,
+      engine,
+      dnnl::sycl_interop::memory_kind::usm,
+      std::vector<void*>{D.data_ptr(), expert_ends_i32.data_ptr()});
+
+  std::unordered_map<int, dnnl::memory> args;
+  args.emplace(DNNL_ARG_SRC, std::move(src_mem));
+  args.emplace(DNNL_ARG_WEIGHTS, wei_mem);
+  args.emplace(DNNL_ARG_DST, std::move(dst_mem));
+  args.emplace(DNNL_ARG_ATTR_SCALES | DNNL_ARG_SRC, src_scales_mem);
+  args.emplace(DNNL_ARG_ATTR_ZERO_POINTS | DNNL_ARG_SRC, src_zp_mem);
+  args.emplace(DNNL_ARG_ATTR_SCALES | DNNL_ARG_WEIGHTS, wei_scales_mem);
+
+  if (iter->second.hint_usm == nullptr) {
+    auto sycl_queue = dnnl::sycl_interop::get_queue(stream);
+    iter->second.hint_usm = sycl::malloc_shared<int32_t>(1, sycl_queue);
+  }
+  iter->second.hint_usm[0] = max_group_size_val;
+  auto hint_md = dnnl::memory::desc(
+      {1}, dnnl::memory::data_type::s32, dnnl::memory::format_tag::a);
+  auto hint_mem = dnnl::sycl_interop::make_memory(
+      hint_md, engine, dnnl::sycl_interop::memory_kind::usm, iter->second.hint_usm);
+  args.emplace(DNNL_ARG_HINT_MAX_GROUP_SIZE, std::move(hint_mem));
+
+  if (bias.has_value()) {
+    const at::Tensor& b = *bias;
+    auto bias_mem =
+        oneDNN::make_onednn_memory(bias_md, engine, b.data_ptr());
+    args.emplace(DNNL_ARG_BIAS, std::move(bias_mem));
+  }
+
+  (void)dnnl::sycl_interop::execute(iter->second.prim, stream, args);
+
+  return D;
 #endif
 }
 

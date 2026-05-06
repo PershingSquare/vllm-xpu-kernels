@@ -86,6 +86,7 @@ namespace oneDNN {
 struct grouped_gemm_cached_primitive_t {
   dnnl::matmul::primitive_desc pd;
   dnnl::matmul prim;
+  int32_t* hint_usm = nullptr;  // Persistent shared USM for MAX_GROUP_SIZE hint
 };
 
 using grouped_gemm_primitive_cache = at::native::onednn::lru_cache<

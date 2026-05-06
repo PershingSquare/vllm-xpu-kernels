@@ -111,41 +111,44 @@ def bench_fn_no_cache(fn_factory, warmup, iters):
 # ---------------------------------------------------------------------------
 
 def run_onednn_w4a8(M, N, K, E, group_size, offsets, warmup, iters):
-    """oneDNN w4a8: u8 activations, s4 weights, bf16 scales (prepacked)."""
-    # Pre-allocate and prepack weights (done once)
+    """oneDNN w4a8: u8 activations, s4 weights, bf16 scales (prepacked v2)."""
     B_packed = torch.randint(0, 256, (E, N, K // 2), dtype=torch.uint8, device=DEVICE)
     B_scales = torch.rand(E, N, K // group_size, dtype=torch.bfloat16, device=DEVICE) * 0.5 + 0.01
     B_s4, B_scales_perm = torch.ops._xpu_C.onednn_grouped_gemm_w4a8_prepack(B_packed, B_scales)
     D = torch.empty(M, N, dtype=torch.bfloat16, device=DEVICE)
 
+    expert_ends_i32 = offsets[1:].to(torch.int32).contiguous()
+    max_group_size = int((offsets[1:] - offsets[:-1]).max().item())
+
     def make_fn():
-        # Fresh activations each call to avoid cache
         A_bf16 = torch.randn(M, K, dtype=torch.bfloat16, device=DEVICE) * 0.1
         A_q, A_scale, A_zp = quantize_per_token_u8(A_bf16)
         A_scale_flat = A_scale.flatten()
         A_zp_flat = A_zp.flatten()
         def fn():
-            torch.ops._xpu_C.onednn_grouped_gemm_w4a8_prepacked(
+            torch.ops._xpu_C.onednn_grouped_gemm_w4a8_prepacked_v2(
                 A_q, A_scale_flat, A_zp_flat, B_s4, B_scales_perm, None,
-                D, offsets, N, K, E)
+                D, expert_ends_i32, N, K, E, max_group_size)
         return fn
 
     return bench_fn_no_cache(make_fn, warmup, iters)
 
 
 def run_onednn_w4a16(M, N, K, E, group_size, offsets, warmup, iters):
-    """oneDNN w4a16: bf16 activations, s4 weights, bf16 scales (prepacked)."""
+    """oneDNN w4a16: bf16 activations, s4 weights, bf16 scales (prepacked v2)."""
     B_packed = torch.randint(0, 256, (E, N, K // 2), dtype=torch.uint8, device=DEVICE)
     B_scales = torch.rand(E, N, K // group_size, dtype=torch.bfloat16, device=DEVICE) * 0.5 + 0.01
-    # Prepack once
     B_s4, B_scales_perm = torch.ops._xpu_C.onednn_grouped_gemm_w4a16_prepack(B_packed, B_scales)
     D = torch.empty(M, N, dtype=torch.bfloat16, device=DEVICE)
+
+    expert_ends_i32 = offsets[1:].to(torch.int32).contiguous()
+    max_group_size = int((offsets[1:] - offsets[:-1]).max().item())
 
     def make_fn():
         A = torch.randn(M, K, dtype=torch.bfloat16, device=DEVICE) * 0.1
         def fn():
-            torch.ops._xpu_C.onednn_grouped_gemm_w4a16_prepacked(
-                A, B_s4, B_scales_perm, None, D, offsets, N, K, E)
+            torch.ops._xpu_C.onednn_grouped_gemm_w4a16_prepacked_v2(
+                A, B_s4, B_scales_perm, None, D, expert_ends_i32, N, K, E, max_group_size)
         return fn
 
     return bench_fn_no_cache(make_fn, warmup, iters)
