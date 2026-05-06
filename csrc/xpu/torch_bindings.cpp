@@ -71,6 +71,22 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, xpu_ops) {
       "onednn_grouped_gemm_w4a16", torch::kXPU, &oneDNN::grouped_gemm_w4a16);
 
   xpu_ops.def(
+      "onednn_grouped_gemm_w4a16_prepack(Tensor ptr_B, "
+      "Tensor ptr_scales) -> (Tensor, Tensor)");
+  xpu_ops.impl(
+      "onednn_grouped_gemm_w4a16_prepack", torch::kXPU,
+      &oneDNN::grouped_gemm_w4a16_prepack);
+
+  xpu_ops.def(
+      "onednn_grouped_gemm_w4a16_prepacked(Tensor ptr_A, Tensor ptr_B_s4, "
+      "Tensor? ptr_scales_permuted, Tensor? ptr_bias, "
+      "Tensor ptr_D, Tensor expert_first_token_offset, "
+      "int N, int K, int num_experts) -> Tensor");
+  xpu_ops.impl(
+      "onednn_grouped_gemm_w4a16_prepacked", torch::kXPU,
+      &oneDNN::grouped_gemm_w4a16_prepacked);
+
+  xpu_ops.def(
       "onednn_grouped_gemm_w4a8(Tensor A_q, Tensor A_scale, Tensor A_zp, "
       "Tensor B_packed_s4, "
       "Tensor B_scales, Tensor? bias, Tensor D, Tensor "

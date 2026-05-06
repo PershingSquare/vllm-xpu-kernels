@@ -13,6 +13,10 @@
 
 #include <oneapi/dnnl/dnnl_debug.h>
 
+#ifndef DNNL_ARG_HINT_MAX_GROUP_SIZE
+#define DNNL_ARG_HINT_MAX_GROUP_SIZE 384
+#endif
+
 namespace oneDNN {
 
 namespace {
@@ -829,6 +833,18 @@ torch::Tensor grouped_gemm_w4a8_prepacked(
   expert_ends_onednn_i32.narrow(0, num_experts, 1)
       .fill_(static_cast<int>(total_M));
 
+  // Compute max group size from expert offsets for dispatch hint.
+  // oneDNN reads this via host_ptr(), so it must be in CPU memory.
+  int32_t max_group_size_val = 0;
+  {
+    auto offsets_cpu = expert_first_token_offset_i32.cpu();
+    const int32_t* optr = offsets_cpu.data_ptr<int32_t>();
+    for (int64_t e = 0; e < num_experts; ++e) {
+      int32_t g = optr[e + 1] - optr[e];
+      if (g > max_group_size_val) max_group_size_val = g;
+    }
+  }
+
   const auto src_dt = dnnl::memory::data_type::u8;
   const auto requested_dst_dt = to_onednn_type(D.scalar_type());
   const auto src_scales_dt = to_onednn_type(A_scale.scalar_type());
@@ -993,6 +1009,17 @@ torch::Tensor grouped_gemm_w4a8_prepacked(
       args.emplace(DNNL_ARG_ATTR_SCALES | DNNL_ARG_SRC, src_scales_mem);
       args.emplace(DNNL_ARG_ATTR_ZERO_POINTS | DNNL_ARG_SRC, src_zp_mem);
       args.emplace(DNNL_ARG_ATTR_SCALES | DNNL_ARG_WEIGHTS, wei_scales_mem);
+      // Max group size hint for oneDNN grouped dispatch.
+      // grouped_micro_gemm dereferences this on the host before kernel launch,
+      // so it must be shared USM (host + device accessible).
+      auto sycl_queue = dnnl::sycl_interop::get_queue(stream);
+      int32_t* hint_usm = sycl::malloc_shared<int32_t>(1, sycl_queue);
+      hint_usm[0] = max_group_size_val;
+      auto hint_md = dnnl::memory::desc(
+          {1}, dnnl::memory::data_type::s32, dnnl::memory::format_tag::a);
+      auto hint_mem = dnnl::sycl_interop::make_memory(
+          hint_md, engine, dnnl::sycl_interop::memory_kind::usm, hint_usm);
+      args.emplace(DNNL_ARG_HINT_MAX_GROUP_SIZE, std::move(hint_mem));
       if (bias.has_value()) {
         const at::Tensor& b = *bias;
         auto bias_mem =
@@ -1001,6 +1028,7 @@ torch::Tensor grouped_gemm_w4a8_prepacked(
       }
 
       (void)dnnl::sycl_interop::execute(iter->second.prim, stream, args);
+      sycl::free(hint_usm, sycl_queue);
     } catch (const dnnl::error& e) {
       if (e.status == dnnl_unimplemented ||
           message_contains(e.what(), "unsupported scales configuration")) {

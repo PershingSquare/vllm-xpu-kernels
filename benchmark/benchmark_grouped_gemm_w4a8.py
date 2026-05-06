@@ -111,10 +111,11 @@ def bench_fn_no_cache(fn_factory, warmup, iters):
 # ---------------------------------------------------------------------------
 
 def run_onednn_w4a8(M, N, K, E, group_size, offsets, warmup, iters):
-    """oneDNN w4a8: u8 activations, s4 weights, bf16 scales."""
-    # Pre-allocate fixed weights (these would be in memory anyway)
+    """oneDNN w4a8: u8 activations, s4 weights, bf16 scales (prepacked)."""
+    # Pre-allocate and prepack weights (done once)
     B_packed = torch.randint(0, 256, (E, N, K // 2), dtype=torch.uint8, device=DEVICE)
     B_scales = torch.rand(E, N, K // group_size, dtype=torch.bfloat16, device=DEVICE) * 0.5 + 0.01
+    B_s4, B_scales_perm = torch.ops._xpu_C.onednn_grouped_gemm_w4a8_prepack(B_packed, B_scales)
     D = torch.empty(M, N, dtype=torch.bfloat16, device=DEVICE)
 
     def make_fn():
@@ -124,8 +125,8 @@ def run_onednn_w4a8(M, N, K, E, group_size, offsets, warmup, iters):
         A_scale_flat = A_scale.flatten()
         A_zp_flat = A_zp.flatten()
         def fn():
-            torch.ops._xpu_C.onednn_grouped_gemm_w4a8(
-                A_q, A_scale_flat, A_zp_flat, B_packed, B_scales, None,
+            torch.ops._xpu_C.onednn_grouped_gemm_w4a8_prepacked(
+                A_q, A_scale_flat, A_zp_flat, B_s4, B_scales_perm, None,
                 D, offsets, N, K, E)
         return fn
 
@@ -133,26 +134,21 @@ def run_onednn_w4a8(M, N, K, E, group_size, offsets, warmup, iters):
 
 
 def run_onednn_w4a16(M, N, K, E, group_size, offsets, warmup, iters):
-    """oneDNN w4a16: bf16 activations, s4 weights, bf16 scales."""
-    old = os.environ.get("VLLM_XPU_GROUPED_GEMM_BACKEND", "")
-    os.environ["VLLM_XPU_GROUPED_GEMM_BACKEND"] = "onednn"
-    try:
-        B_packed = torch.randint(0, 256, (E, N, K // 2), dtype=torch.uint8, device=DEVICE)
-        B_scales = torch.rand(E, N, K // group_size, dtype=torch.bfloat16, device=DEVICE) * 0.5 + 0.01
-        D = torch.empty(M, N, dtype=torch.bfloat16, device=DEVICE)
+    """oneDNN w4a16: bf16 activations, s4 weights, bf16 scales (prepacked)."""
+    B_packed = torch.randint(0, 256, (E, N, K // 2), dtype=torch.uint8, device=DEVICE)
+    B_scales = torch.rand(E, N, K // group_size, dtype=torch.bfloat16, device=DEVICE) * 0.5 + 0.01
+    # Prepack once
+    B_s4, B_scales_perm = torch.ops._xpu_C.onednn_grouped_gemm_w4a16_prepack(B_packed, B_scales)
+    D = torch.empty(M, N, dtype=torch.bfloat16, device=DEVICE)
 
-        def make_fn():
-            A = torch.randn(M, K, dtype=torch.bfloat16, device=DEVICE) * 0.1
-            def fn():
-                torch.ops._xpu_C.grouped_gemm_interface(
-                    ptr_A=A, ptr_B=B_packed, ptr_scales=B_scales, ptr_bias=None,
-                    ptr_D=D, expert_first_token_offset=offsets,
-                    N=N, K=K, num_experts=E, is_B_int4=True, is_B_mxfp4=False)
-            return fn
+    def make_fn():
+        A = torch.randn(M, K, dtype=torch.bfloat16, device=DEVICE) * 0.1
+        def fn():
+            torch.ops._xpu_C.onednn_grouped_gemm_w4a16_prepacked(
+                A, B_s4, B_scales_perm, None, D, offsets, N, K, E)
+        return fn
 
-        return bench_fn_no_cache(make_fn, warmup, iters)
-    finally:
-        os.environ["VLLM_XPU_GROUPED_GEMM_BACKEND"] = old
+    return bench_fn_no_cache(make_fn, warmup, iters)
 
 
 def run_cutlass_w4a16(M, N, K, E, group_size, offsets, warmup, iters):
