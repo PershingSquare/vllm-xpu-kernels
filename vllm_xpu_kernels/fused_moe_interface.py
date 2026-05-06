@@ -237,6 +237,17 @@ def xpu_fused_moe(hidden_states,
     hidden_size = int(hidden_states.shape[1])
     if is_int4 and not hasattr(w13, 'xpu_fused_moe'):
         if backend == "onednn":
+            if using_w4a8:
+                w13_s4, w13_scales_perm = (
+                    torch.ops._xpu_C.onednn_grouped_gemm_w4a8_prepack(
+                        w13, w13_scales))
+                w13.data = w13_s4
+                w13._onednn_scales_prepacked = w13_scales_perm
+                w2_s4, w2_scales_perm = (
+                    torch.ops._xpu_C.onednn_grouped_gemm_w4a8_prepack(
+                        w2, w2_scales))
+                w2.data = w2_s4
+                w2._onednn_scales_prepacked = w2_scales_perm
             if onednn_debug:
                 print(
                     "[vllm_xpu_kernels][onednn][xpu_fused_moe] int4 prepack "
@@ -324,9 +335,10 @@ def xpu_fused_moe(hidden_states,
             remapped_hidden_states)
         A_scale_flat = A_scale.reshape(-1)
         A_zp_flat = A_zp.reshape(-1)
-        torch.ops._xpu_C.onednn_grouped_gemm_w4a8(
+        g1_scales = getattr(w13, '_onednn_scales_prepacked', gemm1_scales)
+        torch.ops._xpu_C.onednn_grouped_gemm_w4a8_prepacked(
             A_q, A_scale_flat, A_zp_flat,
-            input_B, gemm1_scales, w13_bias,
+            input_B, g1_scales, w13_bias,
             gemm1_output, expert_first_token_offset,
             2 * inter_size, hidden_size, num_experts)
     else:
@@ -372,9 +384,10 @@ def xpu_fused_moe(hidden_states,
         A_q2, A_scale2, A_zp2 = _dynamic_per_token_quant_int8(input_A)
         A_scale2_flat = A_scale2.reshape(-1)
         A_zp2_flat = A_zp2.reshape(-1)
-        torch.ops._xpu_C.onednn_grouped_gemm_w4a8(
+        g2_scales = getattr(w2, '_onednn_scales_prepacked', gemm2_scales)
+        torch.ops._xpu_C.onednn_grouped_gemm_w4a8_prepacked(
             A_q2, A_scale2_flat, A_zp2_flat,
-            input_B, gemm2_scales, w2_bias,
+            input_B, g2_scales, w2_bias,
             gemm2_output, expert_first_token_offset,
             hidden_size, inter_size * inter_size_scale, num_experts)
     else:

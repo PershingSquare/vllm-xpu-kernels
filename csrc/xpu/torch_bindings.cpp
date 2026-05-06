@@ -80,6 +80,24 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, xpu_ops) {
       "onednn_grouped_gemm_w4a8", torch::kXPU, &oneDNN::grouped_gemm_w4a8);
 
   xpu_ops.def(
+      "onednn_grouped_gemm_w4a8_prepack(Tensor B_packed_u4, "
+      "Tensor B_scales) -> (Tensor, Tensor)");
+  xpu_ops.impl(
+      "onednn_grouped_gemm_w4a8_prepack",
+      torch::kXPU,
+      &oneDNN::grouped_gemm_w4a8_prepack);
+
+  xpu_ops.def(
+      "onednn_grouped_gemm_w4a8_prepacked(Tensor A_q, Tensor A_scale, "
+      "Tensor A_zp, Tensor B_s4, Tensor B_scales_permuted, Tensor? bias, "
+      "Tensor D, Tensor expert_first_token_offset, "
+      "int N, int K, int num_experts) -> Tensor");
+  xpu_ops.impl(
+      "onednn_grouped_gemm_w4a8_prepacked",
+      torch::kXPU,
+      &oneDNN::grouped_gemm_w4a8_prepacked);
+
+  xpu_ops.def(
       "deepseek_scaling_rope(Tensor! positions, Tensor! query, Tensor! key, "
       "Tensor? offsets_opt, Tensor! cos_sin_cache, int rotary_dim, bool "
       "is_neox_style) "
