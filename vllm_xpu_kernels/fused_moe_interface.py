@@ -322,12 +322,11 @@ def xpu_fused_moe(hidden_states,
     if using_w4a8:
         A_q, A_scale, A_zp = _dynamic_per_token_quant_int8(
             remapped_hidden_states)
-        A_scale_flat = A_scale.reshape(-1).to(torch.float32)
+        A_scale_flat = A_scale.reshape(-1)
         A_zp_flat = A_zp.reshape(-1)
-        B_scales_f32 = gemm1_scales.to(torch.float32) if gemm1_scales is not None else None
         torch.ops._xpu_C.onednn_grouped_gemm_w4a8(
             A_q, A_scale_flat, A_zp_flat,
-            input_B, B_scales_f32, w13_bias,
+            input_B, gemm1_scales, w13_bias,
             gemm1_output, expert_first_token_offset,
             2 * inter_size, hidden_size, num_experts)
     else:
@@ -371,12 +370,11 @@ def xpu_fused_moe(hidden_states,
 
     if using_w4a8:
         A_q2, A_scale2, A_zp2 = _dynamic_per_token_quant_int8(input_A)
-        A_scale2_flat = A_scale2.reshape(-1).to(torch.float32)
+        A_scale2_flat = A_scale2.reshape(-1)
         A_zp2_flat = A_zp2.reshape(-1)
-        B_scales2_f32 = gemm2_scales.to(torch.float32) if gemm2_scales is not None else None
         torch.ops._xpu_C.onednn_grouped_gemm_w4a8(
             A_q2, A_scale2_flat, A_zp2_flat,
-            input_B, B_scales2_f32, w2_bias,
+            input_B, gemm2_scales, w2_bias,
             gemm2_output, expert_first_token_offset,
             hidden_size, inter_size * inter_size_scale, num_experts)
     else:

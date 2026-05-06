@@ -60,8 +60,9 @@ static inline const char* torch_dtype_name(at::ScalarType t) {
   }
 }
 
-static inline bool is_fp16_or_fp32(at::ScalarType t) {
-  return t == at::ScalarType::Half || t == at::ScalarType::Float;
+static inline bool is_fp16_bf16_or_fp32(at::ScalarType t) {
+  return t == at::ScalarType::Half || t == at::ScalarType::BFloat16 ||
+         t == at::ScalarType::Float;
 }
 
 static inline bool is_fp16_or_bf16(at::ScalarType t) {
@@ -220,8 +221,8 @@ torch::Tensor grouped_gemm_w4a8(
       A_q.scalar_type() == at::ScalarType::Byte,
       "A_q must be uint8 (torch.uint8) for oneDNN grouped_gemm_w4a8");
   TORCH_CHECK(
-      is_fp16_or_fp32(A_scale.scalar_type()),
-      "A_scale must be fp16 or fp32 for oneDNN grouped_gemm_w4a8");
+      is_fp16_bf16_or_fp32(A_scale.scalar_type()),
+      "A_scale must be fp16, bf16, or fp32 for oneDNN grouped_gemm_w4a8");
   TORCH_CHECK(
       A_zp.scalar_type() == at::ScalarType::Byte ||
           A_zp.scalar_type() == at::ScalarType::Int ||
@@ -231,8 +232,8 @@ torch::Tensor grouped_gemm_w4a8(
       B_packed_u4.scalar_type() == at::ScalarType::Byte,
       "B_packed_u4 must be uint8 (packed int4) for oneDNN grouped_gemm_w4a8");
   TORCH_CHECK(
-      is_fp16_or_fp32(B_scales.scalar_type()),
-      "B_scales must be fp16 or fp32 for oneDNN grouped_gemm_w4a8");
+      is_fp16_bf16_or_fp32(B_scales.scalar_type()),
+      "B_scales must be fp16, bf16, or fp32 for oneDNN grouped_gemm_w4a8");
   TORCH_CHECK(
       is_fp16_or_bf16(D.scalar_type()),
       "D must be fp16 or bf16 for oneDNN grouped_gemm_w4a8");
@@ -296,8 +297,7 @@ torch::Tensor grouped_gemm_w4a8(
     TORCH_CHECK(b.size(0) == num_experts, "bias.size(0) must match E");
     TORCH_CHECK(b.size(1) == N, "bias.size(1) must match N");
     TORCH_CHECK(
-        is_fp16_or_fp32(b.scalar_type()) ||
-            b.scalar_type() == at::ScalarType::BFloat16,
+        is_fp16_bf16_or_fp32(b.scalar_type()),
         "bias must be fp16, bf16, or fp32 for oneDNN grouped_gemm_w4a8");
   }
 
