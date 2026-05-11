@@ -12,45 +12,6 @@ except ImportError as e:
     FUSEDMOE_AVAILABLE = False
 
 
-def _onednn_grouped_gemm_debug_enabled() -> bool:
-    value = os.environ.get("VLLM_XPU_ONEDNN_GROUPED_GEMM_DEBUG", "")
-    return value.strip().lower() in {"1", "true", "yes", "on"}
-
-
-def _shape_or_none(tensor: torch.Tensor | None):
-    if tensor is None:
-        return None
-    return tuple(int(v) for v in tensor.shape)
-
-
-def _scales_layout_hint(scales: torch.Tensor | None, expected_n: int):
-    if scales is None:
-        return "none"
-    if scales.dim() != 3:
-        return f"unexpected_dim_{scales.dim()}"
-
-    shape = tuple(int(v) for v in scales.shape)
-    if shape[1] == expected_n:
-        return "[E,N,G]"
-    if shape[2] == expected_n:
-        return "[E,G,N]"
-    return f"unknown(shape={shape}, expected_N={expected_n})"
-
-
-def _normalize_onednn_scales_layout(scales: torch.Tensor | None,
-                                    expected_n: int):
-    """Return scales in canonical [E, N, G] layout expected by C++ wrapper."""
-    if scales is None:
-        return None
-    if scales.dim() != 3:
-        return scales
-    if int(scales.shape[1]) == int(expected_n):
-        return scales
-    if int(scales.shape[2]) == int(expected_n):
-        return scales.permute(0, 2, 1).contiguous()
-    return scales
-
-
 def _use_w4a8() -> bool:
     return os.environ.get("VLLM_XPU_USE_W4A8", "0") == "1"
 
@@ -223,7 +184,6 @@ def xpu_fused_moe(hidden_states,
             "output shape must be the same as hidden_states shape"
 
     backend = os.environ.get("VLLM_XPU_GROUPED_GEMM_BACKEND", "").strip().lower()
-    onednn_debug = _onednn_grouped_gemm_debug_enabled()
     using_onednn_int4_backend = is_int4 and backend == "onednn"
     using_w4a8 = using_onednn_int4_backend and _use_w4a8()
 
@@ -236,37 +196,14 @@ def xpu_fused_moe(hidden_states,
 
     hidden_size = int(hidden_states.shape[1])
     if is_int4 and not hasattr(w13, 'xpu_fused_moe'):
-        if backend == "onednn":
-            if using_w4a8:
-                w13_s4, w13_scales_perm = (
-                    torch.ops._xpu_C.onednn_grouped_gemm_w4a8_prepack(
-                        w13, w13_scales))
-                w13.data = w13_s4
-                w13._onednn_scales_prepacked = w13_scales_perm
-                w2_s4, w2_scales_perm = (
-                    torch.ops._xpu_C.onednn_grouped_gemm_w4a8_prepack(
-                        w2, w2_scales))
-                w2.data = w2_s4
-                w2._onednn_scales_prepacked = w2_scales_perm
-            if onednn_debug:
-                print(
-                    "[vllm_xpu_kernels][onednn][xpu_fused_moe] int4 prepack "
-                    f"w13={_shape_or_none(w13)}, w13_scales={_shape_or_none(w13_scales)}, "
-                    f"w2={_shape_or_none(w2)}, w2_scales={_shape_or_none(w2_scales)}, "
-                    f"w13_scales_layout={_scales_layout_hint(w13_scales, 2 * inter_size)}, "
-                    f"w2_scales_layout={_scales_layout_hint(w2_scales, hidden_size)}",
-                    flush=True,
-                )
-        else:
+        if backend != "onednn":
             w13_tmp = torch.empty_like(w13)
             w2_tmp = torch.empty_like(w2)
             for i in range(num_experts):
                 w13_tmp[i] = implement_zp(w13[i])
                 w2_tmp[i] = implement_zp(w2[i])
-            w13_tmp = w13_tmp.contiguous()
-            w2_tmp = w2_tmp.contiguous()
-            w13.data = w13_tmp
-            w2.data = w2_tmp
+            w13.data = w13_tmp.contiguous()
+            w2.data = w2_tmp.contiguous()
         w13.xpu_fused_moe = True
 
     num_rows, hidden_size = list(hidden_states.shape)
@@ -321,24 +258,14 @@ def xpu_fused_moe(hidden_states,
         total_experts_num=total_experts_num,
         local_experts_num=local_experts_num)
 
-    if using_onednn_int4_backend:
-        gemm1_scales = _normalize_onednn_scales_layout(gemm1_scales,
-                                                       2 * inter_size)
-        gemm2_scales = _normalize_onednn_scales_layout(gemm2_scales,
-                                                       hidden_size)
-
-    ########### gemm1 ##################
     input_B = w13
 
     if using_w4a8:
         A_q, A_scale, A_zp = _dynamic_per_token_quant_int8(
             remapped_hidden_states)
-        A_scale_flat = A_scale.reshape(-1)
-        A_zp_flat = A_zp.reshape(-1)
-        g1_scales = getattr(w13, '_onednn_scales_prepacked', gemm1_scales)
-        torch.ops._xpu_C.onednn_grouped_gemm_w4a8_prepacked(
-            A_q, A_scale_flat, A_zp_flat,
-            input_B, g1_scales, w13_bias,
+        torch.ops._xpu_C.onednn_grouped_gemm_w4a8(
+            A_q, A_scale.reshape(-1), A_zp.reshape(-1),
+            input_B, gemm1_scales, w13_bias,
             gemm1_output, expert_first_token_offset,
             2 * inter_size, hidden_size, num_experts)
     else:
@@ -356,7 +283,6 @@ def xpu_fused_moe(hidden_states,
             is_B_mxfp4=is_mxfp4)
 
     inter_size_scale = 2 if activation == "relu2_no_mul" else 1
-    # act
     act_output = torch.empty((num_moe_inputs, inter_size * inter_size_scale),
                              dtype=gemm1_output.dtype,
                              device=gemm1_output.device)
@@ -373,7 +299,6 @@ def xpu_fused_moe(hidden_states,
     else:
         raise ValueError(f"Unsupported FusedMoe activation: {activation}.")
 
-    ########### gemm2 ##################
     input_A = act_output.contiguous()
     input_B = w2
     gemm2_output = torch.empty((num_moe_inputs, hidden_size),
@@ -382,12 +307,9 @@ def xpu_fused_moe(hidden_states,
 
     if using_w4a8:
         A_q2, A_scale2, A_zp2 = _dynamic_per_token_quant_int8(input_A)
-        A_scale2_flat = A_scale2.reshape(-1)
-        A_zp2_flat = A_zp2.reshape(-1)
-        g2_scales = getattr(w2, '_onednn_scales_prepacked', gemm2_scales)
-        torch.ops._xpu_C.onednn_grouped_gemm_w4a8_prepacked(
-            A_q2, A_scale2_flat, A_zp2_flat,
-            input_B, g2_scales, w2_bias,
+        torch.ops._xpu_C.onednn_grouped_gemm_w4a8(
+            A_q2, A_scale2.reshape(-1), A_zp2.reshape(-1),
+            input_B, gemm2_scales, w2_bias,
             gemm2_output, expert_first_token_offset,
             hidden_size, inter_size * inter_size_scale, num_experts)
     else:
