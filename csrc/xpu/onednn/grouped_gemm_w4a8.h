@@ -15,6 +15,7 @@ torch::Tensor grouped_gemm_w4a8(
     torch::Tensor expert_first_token_offset,
     int64_t N,
     int64_t K,
-    int64_t num_experts);
+    int64_t num_experts,
+    int64_t max_expert_size);
 
 }  // namespace oneDNN

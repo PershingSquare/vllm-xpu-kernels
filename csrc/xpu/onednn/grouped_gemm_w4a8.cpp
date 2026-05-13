@@ -59,14 +59,15 @@ torch::Tensor grouped_gemm_w4a8(
     torch::Tensor expert_first_token_offset,
     int64_t N,
     int64_t K,
-    int64_t num_experts) {
+    int64_t num_experts,
+    int64_t max_expert_size) {
 #if !(                                           \
     defined(DNNL_EXPERIMENTAL_GROUPED_MEMORY) && \
     DNNL_EXPERIMENTAL_GROUPED_MEMORY) &&         \
     !(defined(DNNL_EXPERIMENTAL_GROUPED_GEMM) && \
       DNNL_EXPERIMENTAL_GROUPED_GEMM)
   (void)A_q; (void)A_scale; (void)A_zp; (void)B_packed_u4; (void)B_scales;
-  (void)bias; (void)D; (void)expert_first_token_offset; (void)N; (void)K; (void)num_experts;
+  (void)bias; (void)D; (void)expert_first_token_offset; (void)N; (void)K; (void)num_experts; (void)max_expert_size;
   TORCH_CHECK(
       false,
       "oneDNN grouped GEMM is not enabled in this build "
@@ -149,15 +150,7 @@ torch::Tensor grouped_gemm_w4a8(
           ? expert_first_token_offset
           : expert_first_token_offset.to(at::ScalarType::Int);
 
-  torch::Tensor expert_ends_i32 = torch::empty(
-      {num_experts + 1},
-      expert_first_token_offset_i32.options().dtype(at::ScalarType::Int));
-  expert_ends_i32.narrow(0, 0, num_experts)
-      .copy_(expert_first_token_offset_i32.narrow(0, 1, num_experts));
-  expert_ends_i32.narrow(0, num_experts, 1).fill_(static_cast<int>(total_M));
-
-  const int32_t max_group_size_val =
-      static_cast<int32_t>((total_M + num_experts - 1) / num_experts);
+  const int32_t max_expert_size_val = static_cast<int32_t>(max_expert_size);
 
   const auto src_dt = dnnl::memory::data_type::u8;
   const auto requested_dst_dt = to_onednn_type(D.scalar_type());
@@ -219,9 +212,11 @@ torch::Tensor grouped_gemm_w4a8(
   cache_key.group_num = group_num;
   cache_key.group_size = group_size;
   cache_key.has_bias = bias.has_value() ? 1 : 0;
+  cache_key.max_expert_size = max_expert_size;
 
   auto& primitive_cache = get_grouped_gemm_primitive_cache(device_id);
   auto iter = primitive_cache.find(cache_key);
+
   if (iter == primitive_cache.end()) {
     dnnl::matmul::primitive_desc pd;
     try {
@@ -240,6 +235,13 @@ torch::Tensor grouped_gemm_w4a8(
                         grouped_gemm_cached_primitive_t{std::move(pd), std::move(prim)}})
                .first;
   }
+
+  torch::Tensor expert_ends_i32 = torch::empty(
+      {num_experts + 1},
+      expert_first_token_offset_i32.options().dtype(at::ScalarType::Int));
+  expert_ends_i32.narrow(0, 0, num_experts)
+      .copy_(expert_first_token_offset_i32.narrow(0, 1, num_experts));
+  expert_ends_i32.narrow(0, num_experts, 1).fill_(static_cast<int>(total_M));
 
   auto src_mem = dnnl::sycl_interop::make_memory(
       src_md, engine, dnnl::sycl_interop::memory_kind::usm,
@@ -264,7 +266,7 @@ torch::Tensor grouped_gemm_w4a8(
     auto sycl_queue = dnnl::sycl_interop::get_queue(stream);
     iter->second.hint_usm = sycl::malloc_shared<int32_t>(1, sycl_queue);
   }
-  iter->second.hint_usm[0] = max_group_size_val;
+  iter->second.hint_usm[0] = max_expert_size_val;
   auto hint_md = dnnl::memory::desc(
       {1}, dnnl::memory::data_type::s32, dnnl::memory::format_tag::a);
   auto hint_mem = dnnl::sycl_interop::make_memory(

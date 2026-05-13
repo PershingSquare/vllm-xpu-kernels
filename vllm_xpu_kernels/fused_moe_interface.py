@@ -260,6 +260,8 @@ def xpu_fused_moe(hidden_states,
 
     input_B = w13
 
+    max_expert_size = (num_moe_inputs + n_experts_per_token - 1) // n_experts_per_token
+
     if using_w4a8:
         A_q, A_scale, A_zp = _dynamic_per_token_quant_int8(
             remapped_hidden_states)
@@ -267,7 +269,7 @@ def xpu_fused_moe(hidden_states,
             A_q, A_scale.reshape(-1), A_zp.reshape(-1),
             input_B, gemm1_scales, w13_bias,
             gemm1_output, expert_first_token_offset,
-            2 * inter_size, hidden_size, num_experts)
+            2 * inter_size, hidden_size, num_experts, max_expert_size)
     else:
         torch.ops._xpu_C.grouped_gemm_interface(
             ptr_A=remapped_hidden_states,
@@ -280,7 +282,8 @@ def xpu_fused_moe(hidden_states,
             K=hidden_size,
             num_experts=num_experts,
             is_B_int4=is_int4,
-            is_B_mxfp4=is_mxfp4)
+            is_B_mxfp4=is_mxfp4,
+            max_expert_size=max_expert_size)
 
     inter_size_scale = 2 if activation == "relu2_no_mul" else 1
     act_output = torch.empty((num_moe_inputs, inter_size * inter_size_scale),
@@ -311,7 +314,7 @@ def xpu_fused_moe(hidden_states,
             A_q2, A_scale2.reshape(-1), A_zp2.reshape(-1),
             input_B, gemm2_scales, w2_bias,
             gemm2_output, expert_first_token_offset,
-            hidden_size, inter_size * inter_size_scale, num_experts)
+            hidden_size, inter_size * inter_size_scale, num_experts, max_expert_size)
     else:
         torch.ops._xpu_C.grouped_gemm_interface(
             ptr_A=input_A,
@@ -324,7 +327,8 @@ def xpu_fused_moe(hidden_states,
             K=inter_size * inter_size_scale,
             num_experts=num_experts,
             is_B_int4=is_int4,
-            is_B_mxfp4=is_mxfp4)
+            is_B_mxfp4=is_mxfp4,
+            max_expert_size=max_expert_size)
 
     torch.ops._moe_C.moe_gather(output, gemm2_output, topk_weights,
                                 unpermuted_row_to_permuted_row,

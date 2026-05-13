@@ -26,7 +26,8 @@ torch::Tensor grouped_gemm_interface(
     int64_t K,
     int64_t num_experts,
     bool is_B_int4,
-    bool is_B_mxfp4) {
+    bool is_B_mxfp4,
+    int64_t max_expert_size) {
   auto backend = vllm::xpu::getEnv("VLLM_XPU_GROUPED_GEMM_BACKEND");
   if (backend.has_value() && is_B_int4) {
     std::string backend_lc = backend.value();
@@ -36,18 +37,13 @@ torch::Tensor grouped_gemm_interface(
         backend_lc.begin(),
         [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
     if (backend_lc == "onednn") {
+      const int64_t hint = (max_expert_size > 0)
+          ? max_expert_size
+          : expert_first_token_offset[-1].item<int64_t>();
       return oneDNN::grouped_gemm_w4a16(
-          ptr_A,
-          ptr_B,
-          ptr_scales,
-          ptr_bias,
-          ptr_D,
-          expert_first_token_offset,
-          N,
-          K,
-          num_experts,
-          is_B_int4,
-          is_B_mxfp4);
+          ptr_A, ptr_B, ptr_scales, ptr_bias, ptr_D,
+          expert_first_token_offset, N, K, num_experts,
+          is_B_int4, is_B_mxfp4, hint);
     }
   }
 

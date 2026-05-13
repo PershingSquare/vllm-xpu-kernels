@@ -11,4 +11,7 @@ torch::Tensor grouped_gemm_interface(
     int64_t K,
     int64_t num_experts,
     bool is_B_int4,
-    bool is_B_mxfp4);
+    bool is_B_mxfp4,
+    // Used as DNNL_ARG_HINT_MAX_GROUP_SIZE when routing to oneDNN backend.
+    // Pass the actual max tokens per expert for best primitive selection.
+    int64_t max_expert_size = 0);

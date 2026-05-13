@@ -63,7 +63,8 @@ torch::Tensor grouped_gemm_interface(
     int64_t K,
     int64_t num_experts,
     bool is_B_int4,
-    bool is_B_mxfp4);
+    bool is_B_mxfp4,
+    int64_t max_expert_size);
 
 std::tuple<at::Tensor, at::Tensor> deepseek_scaling_rope(
     const at::Tensor& positions,

@@ -4,6 +4,7 @@
 #include "xpu/lora/lora_ops.h"
 #include "xpu/onednn/grouped_gemm_w4a16.h"
 #include "xpu/onednn/grouped_gemm_w4a8.h"
+#include "xpu/onednn/onednn_grouped_gemm_cache.h"
 
 #include <torch/library.h>
 #include <torch/version.h>
@@ -39,23 +40,16 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, xpu_ops) {
 
   xpu_ops.def(
       "grouped_gemm_interface(Tensor ptr_A, Tensor ptr_B, Tensor? ptr_scales, "
-      "Tensor? ptr_bias, "
-      "Tensor "
-      "ptr_D, Tensor "
-      "expert_first_token_offset, int N, int K, int "
-      "num_experts, bool is_B_int4, bool is_B_mxfp4) -> "
-      "Tensor");
+      "Tensor? ptr_bias, Tensor ptr_D, Tensor expert_first_token_offset, "
+      "int N, int K, int num_experts, bool is_B_int4, bool is_B_mxfp4, "
+      "int max_expert_size=0) -> Tensor");
   xpu_ops.impl("grouped_gemm_interface", torch::kXPU, &grouped_gemm_interface);
 
   xpu_ops.def(
       "cutlass_grouped_gemm_interface(Tensor ptr_A, Tensor ptr_B, Tensor? "
-      "ptr_scales, "
-      "Tensor? ptr_bias, "
-      "Tensor "
-      "ptr_D, Tensor "
-      "expert_first_token_offset, int N, int K, int "
-      "num_experts, bool is_B_int4, bool is_B_mxfp4) -> "
-      "Tensor");
+      "ptr_scales, Tensor? ptr_bias, Tensor ptr_D, Tensor "
+      "expert_first_token_offset, int N, int K, int num_experts, "
+      "bool is_B_int4, bool is_B_mxfp4, int max_expert_size=0) -> Tensor");
   xpu_ops.impl(
       "cutlass_grouped_gemm_interface", torch::kXPU, &grouped_gemm_interface);
 
@@ -63,8 +57,8 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, xpu_ops) {
       "onednn_grouped_gemm_w4a16(Tensor ptr_A, Tensor ptr_B, Tensor? "
       "ptr_scales, Tensor? ptr_bias, Tensor ptr_D, "
       "Tensor expert_first_token_offset, "
-      "int N, int K, int num_experts, bool is_B_int4, bool is_B_mxfp4) -> "
-      "Tensor");
+      "int N, int K, int num_experts, bool is_B_int4, bool is_B_mxfp4, "
+      "int max_expert_size) -> Tensor");
   xpu_ops.impl(
       "onednn_grouped_gemm_w4a16", torch::kXPU, &oneDNN::grouped_gemm_w4a16);
 
@@ -72,7 +66,7 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, xpu_ops) {
       "onednn_grouped_gemm_w4a8(Tensor A_q, Tensor A_scale, Tensor A_zp, "
       "Tensor B_packed_u4, Tensor B_scales, Tensor? bias, Tensor D, "
       "Tensor expert_first_token_offset, "
-      "int N, int K, int num_experts) -> Tensor");
+      "int N, int K, int num_experts, int max_expert_size) -> Tensor");
   xpu_ops.impl(
       "onednn_grouped_gemm_w4a8", torch::kXPU, &oneDNN::grouped_gemm_w4a8);
 
@@ -114,6 +108,10 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, xpu_ops) {
 #endif
 
   // for empty tensor functions, we don't need dispatch key like torch::kXPU
+  xpu_ops.def("onednn_grouped_gemm_clear_cache() -> ()");
+  xpu_ops.impl("onednn_grouped_gemm_clear_cache",
+               &oneDNN::clear_grouped_gemm_primitive_cache);
+
   xpu_ops.def("is_bmg(int device_index) -> bool");
   xpu_ops.impl("is_bmg", &is_bmg);
 

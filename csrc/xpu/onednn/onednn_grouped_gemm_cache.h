@@ -31,6 +31,7 @@ struct grouped_gemm_primitive_key_t {
   int64_t group_size = 0;
 
   int64_t has_bias = 0;
+  int64_t max_expert_size = 0;
 
   bool operator==(const grouped_gemm_primitive_key_t& other) const {
     return device_id == other.device_id && src_dtype == other.src_dtype &&
@@ -41,7 +42,8 @@ struct grouped_gemm_primitive_key_t {
         requested_dst_dtype == other.requested_dst_dtype &&
         total_m == other.total_m && n == other.n && k == other.k &&
         num_experts == other.num_experts && group_num == other.group_num &&
-        group_size == other.group_size && has_bias == other.has_bias;
+        group_size == other.group_size && has_bias == other.has_bias &&
+        max_expert_size == other.max_expert_size;
   }
 };
 
@@ -75,6 +77,7 @@ struct hash<oneDNN::grouped_gemm_primitive_key_t> {
     hash_combine(key.group_size);
 
     hash_combine(key.has_bias);
+    hash_combine(key.max_expert_size);
     return seed;
   }
 };
@@ -86,7 +89,7 @@ namespace oneDNN {
 struct grouped_gemm_cached_primitive_t {
   dnnl::matmul::primitive_desc pd;
   dnnl::matmul prim;
-  int32_t* hint_usm = nullptr;  // Persistent shared USM for MAX_GROUP_SIZE hint
+  int32_t* hint_usm = nullptr;
 };
 
 using grouped_gemm_primitive_cache = at::native::onednn::lru_cache<
@@ -109,6 +112,14 @@ inline grouped_gemm_primitive_cache& get_grouped_gemm_primitive_cache(
     mapping.resize(max_cache_capacity);
   }
   return mapping;
+}
+
+inline void clear_grouped_gemm_primitive_cache() {
+  static constexpr int max_device_count = 16;
+  for (int i = 0; i < max_device_count; ++i) {
+    auto& cache = get_grouped_gemm_primitive_cache(i);
+    cache.clear();
+  }
 }
 
 template <typename CreateFn>
