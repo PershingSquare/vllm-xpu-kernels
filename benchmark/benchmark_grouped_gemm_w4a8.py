@@ -390,7 +390,7 @@ def main():
 
         header = f"{'Config':<14}"
         for b in backends:
-            header += f" | {backend_cols[b]:>13}"
+            header += f" | {backend_cols[b]:>22}"
         print(header)
         print("-" * len(header))
 
@@ -400,13 +400,30 @@ def main():
                 token_counts, args.top_k, hint_mode, backends,
                 args.warmup, args.iters, args.pool)
 
+            N, K = cfg["N"], cfg["K"]
+            flops = 2 * total_M * N * K
+            bytes_a = total_M * K
+            bytes_b = E * N * K // 2
+            bytes_c = total_M * N * 2
+            bytes_sc = E * N * (K // cfg["group_size"]) * 2 + total_M * 2
+            bytes_total = bytes_a + bytes_b + bytes_c + bytes_sc
+            BMG_BW_GBS = 456.0
+
             row = f"{label:<14}"
+            mxfp4_ms = results.get("ipex_mxfp4") if "ipex_mxfp4" in backends else None
             for b in backends:
                 ms = results.get(b)
                 if ms is not None:
-                    row += f" | {ms:>12.3f} ms"
+                    tf = flops / (ms * 1e-3) / 1e12
+                    bw_pct = bytes_total / (ms * 1e-3) / (BMG_BW_GBS * 1e9) * 100
+                    if mxfp4_ms is not None and b != "ipex_mxfp4":
+                        speedup = mxfp4_ms / ms
+                        cell = f"{ms:>5.3f}ms {tf:>4.1f}TF {bw_pct:>3.0f}% {speedup:>4.2f}x"
+                    else:
+                        cell = f"{ms:>5.3f}ms {tf:>4.1f}TF {bw_pct:>3.0f}%"
+                    row += f" | {cell:>22}"
                 else:
-                    row += " |          N/A"
+                    row += f" | {'N/A':>22}"
             print(row)
 
         print()
