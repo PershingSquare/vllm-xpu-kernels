@@ -38,6 +38,23 @@ def _quantize_asymmetric_int8_per_row(
     return a_q, scale.to(torch.float32), zp
 
 
+def _quantize_asymmetric_uint8_per_row(
+    a_fp32: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Row-wise asymmetric uint8 quantization matching the oneDNN w4a8 kernel contract."""
+    assert a_fp32.dtype == torch.float32
+    row_min = a_fp32.amin(dim=1)
+    row_max = a_fp32.amax(dim=1)
+    qmin, qmax = 0, 255
+    scale = (row_max - row_min) / float(qmax - qmin)
+    scale = torch.where(scale > 0, scale, torch.ones_like(scale))
+    zp = torch.round(qmin - row_min / scale).clamp(qmin, qmax)
+    a_q = torch.round(a_fp32 / scale.unsqueeze(1) + zp.unsqueeze(1)).clamp(qmin, qmax)
+    a_q = a_q.to(torch.uint8)
+    zp = zp.to(torch.uint8)
+    return a_q, scale.to(torch.float32), zp
+
+
 def _dequantize_u4_zp8(
     packed_u4: torch.Tensor,
     scales: torch.Tensor,
@@ -137,14 +154,12 @@ def test_grouped_gemm_onednn_w4a8_int8(
         ) * (0.1 + 0.05 * e)
 
     # Quantize activations to int8 with row-wise asymmetric scale / zero-point.
-    a_q_cpu, a_scale_cpu, a_zp_cpu = _quantize_asymmetric_int8_per_row(a_fp32_cpu)
+    a_q_cpu, a_scale_cpu, a_zp_cpu = _quantize_asymmetric_uint8_per_row(a_fp32_cpu)
 
-    # oneDNN op inputs on XPU.
     a_q = a_q_cpu.to(device).contiguous()
     a_scale = a_scale_cpu.to(device=device, dtype=torch.float32).contiguous()
-    a_zp = a_zp_cpu.to(device=device, dtype=torch.int32).contiguous()
+    a_zp = a_zp_cpu.to(device=device, dtype=torch.uint8).contiguous()
 
-    # Weights: [E, N, K/2] packed uint4(zp=8) bytes.
     packed_u4_cpu = torch.randint(
         0,
         256,
@@ -152,9 +167,8 @@ def test_grouped_gemm_onednn_w4a8_int8(
         dtype=torch.int32,
         device="cpu",
     ).to(torch.uint8)
-    b_packed_u4 = packed_u4_cpu.to(device).contiguous()
+    b_packed_s4 = ((packed_u4_cpu.to(device) ^ 0x88)).contiguous()
 
-    # Scales: [E, N, K/group_size] (vLLM layout).
     b_scales_cpu = (
         torch.rand(
             (num_experts, n, group_num),
@@ -162,7 +176,7 @@ def test_grouped_gemm_onednn_w4a8_int8(
             device="cpu",
         ) * 0.5 + 0.01
     )
-    b_scales = b_scales_cpu.to(device).contiguous()
+    b_scales = b_scales_cpu.permute(0, 2, 1).contiguous().to(device)
 
     bias_cpu: torch.Tensor | None
     bias: torch.Tensor | None
@@ -183,12 +197,14 @@ def test_grouped_gemm_onednn_w4a8_int8(
     # -----------------------------
     # Run oneDNN op
     # -----------------------------
+    max_expert_size = max(token_counts) if token_counts else 0
+
     try:
         out_ret = torch.ops._xpu_C.onednn_grouped_gemm_w4a8(
             a_q,
             a_scale,
             a_zp,
-            b_packed_u4,
+            b_packed_s4,
             b_scales,
             bias,
             out,
@@ -196,13 +212,14 @@ def test_grouped_gemm_onednn_w4a8_int8(
             n,
             k,
             num_experts,
+            max_expert_size,
         )
 
         out_ret_repeat = torch.ops._xpu_C.onednn_grouped_gemm_w4a8(
             a_q,
             a_scale,
             a_zp,
-            b_packed_u4,
+            b_packed_s4,
             b_scales,
             bias,
             out_repeat,
@@ -210,6 +227,7 @@ def test_grouped_gemm_onednn_w4a8_int8(
             n,
             k,
             num_experts,
+            max_expert_size,
         )
     except RuntimeError as e:
         msg = str(e)
