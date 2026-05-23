@@ -90,6 +90,24 @@ struct grouped_gemm_cached_primitive_t {
   dnnl::matmul::primitive_desc pd;
   dnnl::matmul prim;
   int32_t* hint_usm = nullptr;
+  // Pre-allocated USM buffer for int64->int32 offsets conversion.
+  // Sized to (num_experts + 1). Reused across calls; saves the
+  // PyTorch caching-allocator round-trip on each .to(Int) call.
+  int32_t* offsets_i32_usm = nullptr;
+  int offsets_i32_capacity = 0;
+  // Pre-built dnnl::memory wrappers and args map. data pointers
+  // are updated per call via set_data_handle(); avoids 9x
+  // make_memory + 9x unordered_map::emplace per call.
+  bool memories_built = false;
+  dnnl::memory src_mem;
+  dnnl::memory dst_mem;
+  dnnl::memory wei_mem;
+  dnnl::memory wei_scales_mem;
+  dnnl::memory src_scales_mem;
+  dnnl::memory src_zp_mem;
+  dnnl::memory hint_mem;
+  dnnl::memory bias_mem;
+  std::unordered_map<int, dnnl::memory> args;
 };
 
 using grouped_gemm_primitive_cache = at::native::onednn::lru_cache<

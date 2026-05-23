@@ -239,48 +239,74 @@ torch::Tensor grouped_gemm_w4a8(
   // oneDNN grouped-memory expects expert-end offsets [num_experts].
   // expert_first_token_offset_i32 has shape [num_experts+1] with
   // [0, end_e0, ..., total_M], so a view at offset 1 is the ends array.
-  // Avoids a per-call alloc + copy + fill on the device.
   torch::Tensor expert_ends_i32 =
       expert_first_token_offset_i32.narrow(0, 1, num_experts);
 
-  auto src_mem = dnnl::sycl_interop::make_memory(
-      src_md, engine, dnnl::sycl_interop::memory_kind::usm,
-      std::vector<void*>{A_q.data_ptr(), expert_ends_i32.data_ptr()});
-  auto dst_mem = dnnl::sycl_interop::make_memory(
-      dst_md, engine, dnnl::sycl_interop::memory_kind::usm,
-      std::vector<void*>{D.data_ptr(), expert_ends_i32.data_ptr()});
-  auto wei_mem = oneDNN::make_onednn_memory(wei_md, engine, B_packed_u4.data_ptr());
-  auto wei_scales_mem = oneDNN::make_onednn_memory(wei_scales_md, engine, B_scales.data_ptr());
-  auto src_scales_mem = oneDNN::make_onednn_memory(src_scales_md, engine, src_scales_onednn.data_ptr());
-  auto src_zp_mem = oneDNN::make_onednn_memory(src_zp_md, engine, src_zp_onednn.data_ptr());
+  auto& cached = iter->second;
 
-  std::unordered_map<int, dnnl::memory> args;
-  args.emplace(DNNL_ARG_SRC, std::move(src_mem));
-  args.emplace(DNNL_ARG_WEIGHTS, std::move(wei_mem));
-  args.emplace(DNNL_ARG_DST, std::move(dst_mem));
-  args.emplace(DNNL_ARG_ATTR_SCALES | DNNL_ARG_SRC, std::move(src_scales_mem));
-  args.emplace(DNNL_ARG_ATTR_ZERO_POINTS | DNNL_ARG_SRC, std::move(src_zp_mem));
-  args.emplace(DNNL_ARG_ATTR_SCALES | DNNL_ARG_WEIGHTS, std::move(wei_scales_mem));
-
-  if (iter->second.hint_usm == nullptr) {
+  // Allocate hint USM lazily.
+  if (cached.hint_usm == nullptr) {
     auto sycl_queue = dnnl::sycl_interop::get_queue(stream);
-    iter->second.hint_usm = sycl::malloc_shared<int32_t>(1, sycl_queue);
+    cached.hint_usm = sycl::malloc_shared<int32_t>(1, sycl_queue);
   }
-  iter->second.hint_usm[0] = max_expert_size_val;
-  auto hint_md = dnnl::memory::desc(
-      {1}, dnnl::memory::data_type::s32, dnnl::memory::format_tag::a);
-  auto hint_mem = dnnl::sycl_interop::make_memory(
-      hint_md, engine, dnnl::sycl_interop::memory_kind::usm, iter->second.hint_usm);
-  args.emplace(DNNL_ARG_HINT_MAX_GROUP_SIZE, std::move(hint_mem));
+  cached.hint_usm[0] = max_expert_size_val;
 
-  if (bias.has_value()) {
-    const at::Tensor& b = *bias;
-    auto bias_mem = oneDNN::make_onednn_memory(bias_md, engine, b.data_ptr());
-    args.emplace(DNNL_ARG_BIAS, std::move(bias_mem));
+  // Build the dnnl::memory objects + args map ONCE per cache entry. After
+  // the first call, the data pointers are updated cheaply via
+  // set_data_handle() instead of constructing fresh memories every call.
+  if (!cached.memories_built) {
+    auto hint_md = dnnl::memory::desc(
+        {1}, dnnl::memory::data_type::s32, dnnl::memory::format_tag::a);
+    cached.src_mem = dnnl::sycl_interop::make_memory(
+        src_md, engine, dnnl::sycl_interop::memory_kind::usm,
+        std::vector<void*>{A_q.data_ptr(), expert_ends_i32.data_ptr()});
+    cached.dst_mem = dnnl::sycl_interop::make_memory(
+        dst_md, engine, dnnl::sycl_interop::memory_kind::usm,
+        std::vector<void*>{D.data_ptr(), expert_ends_i32.data_ptr()});
+    cached.wei_mem = oneDNN::make_onednn_memory(
+        wei_md, engine, B_packed_u4.data_ptr());
+    cached.wei_scales_mem = oneDNN::make_onednn_memory(
+        wei_scales_md, engine, B_scales.data_ptr());
+    cached.src_scales_mem = oneDNN::make_onednn_memory(
+        src_scales_md, engine, src_scales_onednn.data_ptr());
+    cached.src_zp_mem = oneDNN::make_onednn_memory(
+        src_zp_md, engine, src_zp_onednn.data_ptr());
+    cached.hint_mem = dnnl::sycl_interop::make_memory(
+        hint_md, engine, dnnl::sycl_interop::memory_kind::usm,
+        cached.hint_usm);
+    cached.args.emplace(DNNL_ARG_SRC, cached.src_mem);
+    cached.args.emplace(DNNL_ARG_WEIGHTS, cached.wei_mem);
+    cached.args.emplace(DNNL_ARG_DST, cached.dst_mem);
+    cached.args.emplace(DNNL_ARG_ATTR_SCALES | DNNL_ARG_SRC, cached.src_scales_mem);
+    cached.args.emplace(DNNL_ARG_ATTR_ZERO_POINTS | DNNL_ARG_SRC, cached.src_zp_mem);
+    cached.args.emplace(DNNL_ARG_ATTR_SCALES | DNNL_ARG_WEIGHTS, cached.wei_scales_mem);
+    cached.args.emplace(DNNL_ARG_HINT_MAX_GROUP_SIZE, cached.hint_mem);
+    if (bias.has_value()) {
+      cached.bias_mem = oneDNN::make_onednn_memory(
+          bias_md, engine, bias->data_ptr());
+      cached.args.emplace(DNNL_ARG_BIAS, cached.bias_mem);
+    }
+    cached.memories_built = true;
+  } else {
+    // Update pointers that change per call. Index 0 = main data buffer;
+    // index 1 = grouped-memory expert-end-offsets buffer.
+    cached.src_mem.set_data_handle(A_q.data_ptr(), 0);
+    cached.src_mem.set_data_handle(expert_ends_i32.data_ptr(), 1);
+    cached.dst_mem.set_data_handle(D.data_ptr(), 0);
+    cached.dst_mem.set_data_handle(expert_ends_i32.data_ptr(), 1);
+    cached.src_scales_mem.set_data_handle(src_scales_onednn.data_ptr());
+    cached.src_zp_mem.set_data_handle(src_zp_onednn.data_ptr());
+    cached.wei_mem.set_data_handle(B_packed_u4.data_ptr());
+    cached.wei_scales_mem.set_data_handle(B_scales.data_ptr());
+    if (bias.has_value()) {
+      cached.bias_mem.set_data_handle(bias->data_ptr());
+    }
+    // hint_mem already wraps cached.hint_usm; the value at *hint_usm was
+    // updated above.
   }
 
   try {
-    (void)dnnl::sycl_interop::execute(iter->second.prim, stream, args);
+    (void)dnnl::sycl_interop::execute(cached.prim, stream, cached.args);
   } catch (const dnnl::error& e) {
     TORCH_CHECK(false, "oneDNN grouped_gemm_w4a8: execute failed: ", e.what());
   }
