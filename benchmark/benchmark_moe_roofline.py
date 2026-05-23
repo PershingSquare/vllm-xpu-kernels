@@ -158,9 +158,11 @@ def bench_cold(fns_list, warmup, iters, repetitions=3):
 # Backend runners with pool-based cold-cache simulation
 # ---------------------------------------------------------------------------
 
-def run_onednn_w4a8(M, N, K, E, group_size, offsets, max_expert_size, warmup, iters, POOL):
+def run_onednn_w4a8(M, N, K, E, group_size, offsets, max_expert_size, warmup, iters, POOL, use_bias=True):
     B_s4 = (torch.randint(0, 256, (E, N, K // 2), dtype=torch.uint8, device=DEVICE) ^ 0x88).contiguous()
     B_scales = torch.rand(E, K // group_size, N, dtype=torch.bfloat16, device=DEVICE) * 0.5 + 0.01
+    # gpt-oss has per-expert bias [E, N] on both gate/up and down projections.
+    bias = (torch.randn(E, N, dtype=torch.bfloat16, device=DEVICE) * 0.01).contiguous() if use_bias else None
 
     pool_Aq = [torch.empty(M, K, dtype=torch.uint8, device=DEVICE) for _ in range(POOL)]
     pool_Ascale = [torch.empty(M, dtype=torch.bfloat16, device=DEVICE) for _ in range(POOL)]
@@ -177,7 +179,7 @@ def run_onednn_w4a8(M, N, K, E, group_size, offsets, max_expert_size, warmup, it
         def fn():
             torch.ops._xpu_C.onednn_grouped_gemm_w4a8(
                 pool_Aq[slot], pool_Ascale[slot], pool_Azp[slot],
-                B_s4, B_scales, None,
+                B_s4, B_scales, bias,
                 pool_D[slot], offsets, N, K, E, max_expert_size)
         return fn
 
@@ -185,9 +187,10 @@ def run_onednn_w4a8(M, N, K, E, group_size, offsets, max_expert_size, warmup, it
     return bench_cold(fns_list, warmup, iters)
 
 
-def run_onednn_w4a16(M, N, K, E, group_size, offsets, max_expert_size, warmup, iters, POOL):
+def run_onednn_w4a16(M, N, K, E, group_size, offsets, max_expert_size, warmup, iters, POOL, use_bias=True):
     B_s4 = (torch.randint(0, 256, (E, N, K // 2), dtype=torch.uint8, device=DEVICE) ^ 0x88).contiguous()
     B_scales = torch.rand(E, K // group_size, N, dtype=torch.bfloat16, device=DEVICE) * 0.5 + 0.01
+    bias = (torch.randn(E, N, dtype=torch.bfloat16, device=DEVICE) * 0.01).contiguous() if use_bias else None
 
     pool_A = [torch.empty(M, K, dtype=torch.bfloat16, device=DEVICE) for _ in range(POOL)]
     pool_D = [torch.empty(M, N, dtype=torch.bfloat16, device=DEVICE) for _ in range(POOL)]
@@ -197,7 +200,7 @@ def run_onednn_w4a16(M, N, K, E, group_size, offsets, max_expert_size, warmup, i
 
         def fn():
             torch.ops._xpu_C.onednn_grouped_gemm_w4a16(
-                pool_A[slot], B_s4, B_scales, None,
+                pool_A[slot], B_s4, B_scales, bias,
                 pool_D[slot], offsets, N, K, E,
                 True, False, max_expert_size)
         return fn
@@ -206,7 +209,7 @@ def run_onednn_w4a16(M, N, K, E, group_size, offsets, max_expert_size, warmup, i
     return bench_cold(fns_list, warmup, iters)
 
 
-def run_cutlass_w4a16(M, N, K, E, group_size, offsets, warmup, iters, POOL):
+def run_cutlass_w4a16(M, N, K, E, group_size, offsets, warmup, iters, POOL, use_bias=True):
     """Cutlass w4a16: bf16 activations, int4 weights."""
     old = os.environ.get("VLLM_XPU_GROUPED_GEMM_BACKEND", "")
     os.environ["VLLM_XPU_GROUPED_GEMM_BACKEND"] = ""
@@ -214,6 +217,7 @@ def run_cutlass_w4a16(M, N, K, E, group_size, offsets, warmup, iters, POOL):
         # B and scales are fixed (shared across pool)
         B_packed = torch.randint(0, 256, (E, N, K // 2), dtype=torch.uint8, device=DEVICE)
         B_scales = torch.rand(E, N, K // group_size, dtype=torch.bfloat16, device=DEVICE) * 0.5 + 0.01
+        bias = (torch.randn(E, N, dtype=torch.bfloat16, device=DEVICE) * 0.01).contiguous() if use_bias else None
 
         # Pool of buffers: (Abf, D)
         pool_A = [torch.empty(M, K, dtype=torch.bfloat16, device=DEVICE) for _ in range(POOL)]
@@ -225,7 +229,7 @@ def run_cutlass_w4a16(M, N, K, E, group_size, offsets, warmup, iters, POOL):
 
             def fn():
                 torch.ops._xpu_C.grouped_gemm_interface(
-                    ptr_A=pool_A[slot], ptr_B=B_packed, ptr_scales=B_scales, ptr_bias=None,
+                    ptr_A=pool_A[slot], ptr_B=B_packed, ptr_scales=B_scales, ptr_bias=bias,
                     ptr_D=pool_D[slot], expert_first_token_offset=offsets,
                     N=N, K=K, num_experts=E, is_B_int4=True, is_B_mxfp4=False)
             return fn
@@ -236,7 +240,7 @@ def run_cutlass_w4a16(M, N, K, E, group_size, offsets, warmup, iters, POOL):
         os.environ["VLLM_XPU_GROUPED_GEMM_BACKEND"] = old
 
 
-def run_cutlass_mxfp4(M, N, K, E, group_size, offsets, warmup, iters, POOL):
+def run_cutlass_mxfp4(M, N, K, E, group_size, offsets, warmup, iters, POOL, use_bias=True):
     """Cutlass mxfp4: bf16 activations, mxfp4 weights, uint8 MX scales."""
     old = os.environ.get("VLLM_XPU_GROUPED_GEMM_BACKEND", "")
     os.environ["VLLM_XPU_GROUPED_GEMM_BACKEND"] = ""
@@ -244,6 +248,7 @@ def run_cutlass_mxfp4(M, N, K, E, group_size, offsets, warmup, iters, POOL):
         # B packed u8, scales uint8 [E,N,K//gs]
         B_packed = torch.randint(0, 256, (E, N, K // 2), dtype=torch.uint8, device=DEVICE)
         B_scales = torch.randint(0, 256, (E, N, K // group_size), dtype=torch.uint8, device=DEVICE)
+        bias = (torch.randn(E, N, dtype=torch.bfloat16, device=DEVICE) * 0.01).contiguous() if use_bias else None
 
         # Pool of buffers: (Abf, D)
         pool_A = [torch.empty(M, K, dtype=torch.bfloat16, device=DEVICE) for _ in range(POOL)]
@@ -255,7 +260,7 @@ def run_cutlass_mxfp4(M, N, K, E, group_size, offsets, warmup, iters, POOL):
 
             def fn():
                 torch.ops._xpu_C.grouped_gemm_interface(
-                    ptr_A=pool_A[slot], ptr_B=B_packed, ptr_scales=B_scales, ptr_bias=None,
+                    ptr_A=pool_A[slot], ptr_B=B_packed, ptr_scales=B_scales, ptr_bias=bias,
                     ptr_D=pool_D[slot], expert_first_token_offset=offsets,
                     N=N, K=K, num_experts=E, is_B_int4=False, is_B_mxfp4=True)
             return fn
@@ -266,7 +271,7 @@ def run_cutlass_mxfp4(M, N, K, E, group_size, offsets, warmup, iters, POOL):
         os.environ["VLLM_XPU_GROUPED_GEMM_BACKEND"] = old
 
 
-def run_ipex_int4(M, N, K, E, group_size, offsets, warmup, iters, POOL):
+def run_ipex_int4(M, N, K, E, group_size, offsets, warmup, iters, POOL, use_bias=True):
     """IPEX moe_gemm int4: bf16 activations, int4 weights, bf16 scales."""
     import torch.xpu as xpu
     import intel_extension_for_pytorch  # noqa
@@ -275,6 +280,8 @@ def run_ipex_int4(M, N, K, E, group_size, offsets, warmup, iters, POOL):
     # IPEX weight layout: [E, K//2, N]
     B_packed = torch.randint(0, 256, (E, K // 2, N), dtype=torch.uint8, device=DEVICE)
     B_scales = torch.rand(E, ipex_group_num, N, dtype=torch.bfloat16, device=DEVICE) * 0.5 + 0.01
+    # gpt-oss bias [E, N] in bf16
+    bias = (torch.randn(E, N, dtype=torch.bfloat16, device=DEVICE) * 0.01).contiguous() if use_bias else None
     counts = offsets[1:] - offsets[:-1]
     rows_for_experts = counts.to(torch.int32)
 
@@ -287,14 +294,14 @@ def run_ipex_int4(M, N, K, E, group_size, offsets, warmup, iters, POOL):
 
         def fn():
             xpu.moe_gemm(pool_A[slot], B_packed, rows_for_experts, E,
-                         matrix_b_scale_inv=B_scales, is_int4=True)
+                         matrix_b_scale_inv=B_scales, bias=bias, is_int4=True)
         return fn
 
     fns_list = [make_fn(i) for i in range(POOL)]
     return bench_cold(fns_list, warmup, iters)
 
 
-def run_ipex_mxfp4(M, N, K, E, group_size, offsets, warmup, iters, POOL):
+def run_ipex_mxfp4(M, N, K, E, group_size, offsets, warmup, iters, POOL, use_bias=True):
     """IPEX moe_gemm mxfp4: bf16 activations, mxfp4 weights, uint8 MX scales (group_size=32 only)."""
     import torch.xpu as xpu
     import intel_extension_for_pytorch  # noqa
@@ -305,6 +312,8 @@ def run_ipex_mxfp4(M, N, K, E, group_size, offsets, warmup, iters, POOL):
     # IPEX weight layout: [E, K//2, N] (transposed vs cutlass [E, N, K//2])
     B_packed = torch.randint(0, 256, (E, K // 2, N), dtype=torch.uint8, device=DEVICE)
     B_scales = torch.randint(0, 256, (E, ipex_group_num, N), dtype=torch.uint8, device=DEVICE)
+    # gpt-oss bias [E, N] in bf16
+    bias = (torch.randn(E, N, dtype=torch.bfloat16, device=DEVICE) * 0.01).contiguous() if use_bias else None
     counts = offsets[1:] - offsets[:-1]
     rows_for_experts = counts.to(torch.int32)
 
@@ -317,7 +326,7 @@ def run_ipex_mxfp4(M, N, K, E, group_size, offsets, warmup, iters, POOL):
 
         def fn():
             xpu.moe_gemm(pool_A[slot], B_packed, rows_for_experts, E,
-                         matrix_b_scale_inv=B_scales, is_mxfp4=True)
+                         matrix_b_scale_inv=B_scales, bias=bias, is_mxfp4=True)
         return fn
 
     fns_list = [make_fn(i) for i in range(POOL)]
@@ -340,33 +349,35 @@ ONEDNN_BACKENDS = {"onednn_w4a8", "onednn_w4a16"}
 # Roofline analysis
 # ---------------------------------------------------------------------------
 
-def compute_bytes(total_M, N, K, e_active, group_size, backend):
+def compute_bytes(total_M, N, K, e_active, group_size, backend, use_bias=True):
+    # bias is [E, N] bf16; only active experts read it.
+    bias_bytes = e_active * N * 2 if use_bias else 0
     if backend == "onednn_w4a8":
         bytes_a = total_M * K * 1
         bytes_b = e_active * N * K // 2
         bytes_d = total_M * N * 2
         bytes_scales_w = e_active * (K // group_size) * N * 2
         bytes_scales_a = total_M * 2
-        return bytes_a + bytes_b + bytes_d + bytes_scales_w + bytes_scales_a
+        return bytes_a + bytes_b + bytes_d + bytes_scales_w + bytes_scales_a + bias_bytes
     elif backend in ("onednn_w4a16", "cutlass_w4a16", "ipex_int4"):
         bytes_a = total_M * K * 2
         bytes_b = e_active * N * K // 2
         bytes_d = total_M * N * 2
         bytes_scales_w = e_active * (K // group_size) * N * 2
-        return bytes_a + bytes_b + bytes_d + bytes_scales_w
+        return bytes_a + bytes_b + bytes_d + bytes_scales_w + bias_bytes
     elif backend in ("cutlass_mxfp4", "ipex_mxfp4"):
         bytes_a = total_M * K * 2
         bytes_b = e_active * N * K // 2
         bytes_d = total_M * N * 2
         bytes_scales_w = e_active * (K // group_size) * N * 1
-        return bytes_a + bytes_b + bytes_d + bytes_scales_w
+        return bytes_a + bytes_b + bytes_d + bytes_scales_w + bias_bytes
     else:
         raise ValueError(f"Unknown backend: {backend}")
 
 
-def roofline_stats(ms, total_M, N, K, e_active, group_size, backend):
+def roofline_stats(ms, total_M, N, K, e_active, group_size, backend, use_bias=True):
     flops = 2 * total_M * N * K
-    bytes_total = compute_bytes(total_M, N, K, e_active, group_size, backend)
+    bytes_total = compute_bytes(total_M, N, K, e_active, group_size, backend, use_bias)
 
     achieved_ops_per_sec = flops / (ms * 1e-3)   # ops/sec
     achieved_gbs = bytes_total / (ms * 1e-3) / 1e9
@@ -434,7 +445,7 @@ def filter_distribution(dist, coverage=0.95):
 # Run benchmark for a single (config, backend, M) combination
 # ---------------------------------------------------------------------------
 
-def run_benchmark(total_M, N, K, E, group_size, top_k, backend, warmup, iters, POOL, token_dist="real"):
+def run_benchmark(total_M, N, K, E, group_size, top_k, backend, warmup, iters, POOL, token_dist="real", use_bias=True):
     if token_dist == "real":
         token_counts = scale_tokens_to_M(REAL_EXPERT_TOKENS, total_M)
     else:
@@ -445,9 +456,9 @@ def run_benchmark(total_M, N, K, E, group_size, top_k, backend, warmup, iters, P
 
     try:
         if backend in ONEDNN_BACKENDS:
-            ms = RUNNERS[backend](total_M, N, K, E, group_size, offsets, max_expert_size, warmup, iters, POOL)
+            ms = RUNNERS[backend](total_M, N, K, E, group_size, offsets, max_expert_size, warmup, iters, POOL, use_bias)
         else:
-            ms = RUNNERS[backend](total_M, N, K, E, group_size, offsets, warmup, iters, POOL)
+            ms = RUNNERS[backend](total_M, N, K, E, group_size, offsets, warmup, iters, POOL, use_bias)
         return ms, e_active
     except Exception as e:
         print(f"  {backend}: FAILED - {str(e)[:80]}")
@@ -466,7 +477,7 @@ def run_offline(args, configs, backends):
 
     print("=" * 110)
     print("Roofline Benchmark — OFFLINE MODE")
-    print(f"E={E}, Total M={total_M} (tokens=3072, top_k={args.top_k})")
+    print(f"E={E}, Total M={total_M} (tokens=3072, top_k={args.top_k}), bias={'on' if args.bias else 'off'}")
     print(f"Peak INT8: {PEAK_INT8_TOPS} TOPS | Peak BF16: {PEAK_BF16_TFLOPS} TFLOPS | Peak BW: {PEAK_BW_GBS} GB/s")
     print(f"Backends: {backends}")
     print("=" * 110)
@@ -479,9 +490,9 @@ def run_offline(args, configs, backends):
     for label, cfg in configs:
         N, K, group_size = cfg["N"], cfg["K"], cfg["group_size"]
         for backend in backends:
-            ms, e_active = run_benchmark(total_M, N, K, E, group_size, args.top_k, backend, args.warmup, args.iters, args.pool)
+            ms, e_active = run_benchmark(total_M, N, K, E, group_size, args.top_k, backend, args.warmup, args.iters, args.pool, use_bias=args.bias)
             if ms is not None:
-                tops, bw, ai, bound, roofline_pct = roofline_stats(ms, total_M, N, K, e_active, group_size, backend)
+                tops, bw, ai, bound, roofline_pct = roofline_stats(ms, total_M, N, K, e_active, group_size, backend, args.bias)
                 print(f"{label:<12} | {backend:<16} | {total_M:>6} | {ms:>8.3f} | "
                       f"{tops:>11.2f} | {bw:>9.1f} | {ai:>7.2f} | {bound:<8} | {roofline_pct:>8.1f}%")
             else:
@@ -520,7 +531,7 @@ def run_server(args, configs, backends):
 
     print("=" * 110)
     print("Roofline Benchmark — SERVER MODE")
-    print(f"E={E}, top_k={args.top_k}")
+    print(f"E={E}, top_k={args.top_k}, bias={'on' if args.bias else 'off'}")
     print(f"Distribution: {len(dist)} unique token counts, {total_occurrences} total occurrences "
           f"(dropped {dropped_offline} occurrences at tokens={OFFLINE_TOKENS} — offline-only)")
     print(f"After {args.coverage*100:.0f}% coverage filter: {num_m_values} M values, "
@@ -550,10 +561,10 @@ def run_server(args, configs, backends):
                 total_M = tokens * args.top_k
                 if total_M < 1:
                     continue
-                ms, e_active = run_benchmark(total_M, N, K, E, group_size, args.top_k, backend, args.warmup, args.iters, args.pool, args.token_dist)
+                ms, e_active = run_benchmark(total_M, N, K, E, group_size, args.top_k, backend, args.warmup, args.iters, args.pool, args.token_dist, use_bias=args.bias)
                 weight = m_weights[tokens]
                 if ms is not None:
-                    tops, bw, ai, bound, roofline_pct = roofline_stats(ms, total_M, N, K, e_active, group_size, backend)
+                    tops, bw, ai, bound, roofline_pct = roofline_stats(ms, total_M, N, K, e_active, group_size, backend, args.bias)
                     print(f"{label:<12} | {backend:<16} | {total_M:>6} | {ms:>8.3f} | "
                           f"{tops:>11.2f} | {bw:>9.1f} | {ai:>7.2f} | {bound:<8} | {roofline_pct:>8.1f}%")
                     all_results[key].append((ms, total_M, weight, e_active))
@@ -586,7 +597,7 @@ def run_server(args, configs, backends):
             avg_M = int(round(weighted_M))
             avg_e_active = int(round(sum(ea * w for _, _, w, ea in entries) / total_weight))
 
-            tops, bw, ai, bound, roofline_pct = roofline_stats(weighted_ms, avg_M, N, K, avg_e_active, group_size, backend)
+            tops, bw, ai, bound, roofline_pct = roofline_stats(weighted_ms, avg_M, N, K, avg_e_active, group_size, backend, args.bias)
             print(f"{label:<12} | {backend:<16} | {avg_M:>6} | {weighted_ms:>8.3f} | "
                   f"{tops:>11.2f} | {bw:>9.1f} | {ai:>7.2f} | {bound:<8} | {roofline_pct:>8.1f}%")
 
@@ -616,7 +627,7 @@ def run_server(args, configs, backends):
                 weighted_M = sum(m * w for _, m, w, _ in entries) / total_weight
                 avg_M = int(round(weighted_M))
                 avg_e_active = int(round(sum(ea * w for _, _, w, ea in entries) / total_weight))
-                tops, bw, ai, bound, roofline_pct = roofline_stats(weighted_ms, avg_M, N, K, avg_e_active, group_size, backend)
+                tops, bw, ai, bound, roofline_pct = roofline_stats(weighted_ms, avg_M, N, K, avg_e_active, group_size, backend, args.bias)
                 print(f"{label:<12} | {backend:<16} | {avg_M:>6} | {weighted_ms:>8.3f} | "
                       f"{tops:>11.2f} | {bw:>9.1f} | {ai:>7.2f} | {bound:<8} | {roofline_pct:>8.1f}% | {bucket_label}")
 
@@ -650,7 +661,10 @@ def main():
                         help="Fraction of mass to keep for server mode (default: 0.95)")
     parser.add_argument("--token-dist", type=str, choices=["real", "uniform"], default="real",
                         help="Token distribution across experts: real (REAL_EXPERT_TOKENS) or uniform (default: real)")
+    parser.add_argument("--bias", type=str, choices=["on", "off"], default="on",
+                        help="Include per-expert bias [E,N] bf16 to match gpt-oss production (default: on)")
     args = parser.parse_args()
+    args.bias = (args.bias == "on")
 
     backends = ALL_BACKENDS if "all" in args.backend else args.backend
 
