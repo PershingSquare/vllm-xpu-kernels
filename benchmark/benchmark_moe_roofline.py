@@ -123,20 +123,35 @@ def count_active_experts(offsets) -> int:
 # Cold-cache timing with rotating pool of pre-allocated buffers
 # ---------------------------------------------------------------------------
 
-def bench_cold(fns_list, warmup, iters):
+def bench_cold(fns_list, warmup, iters, repetitions=3):
     """Time with rotating pool of pre-allocated buffers for cold-cache simulation.
 
     fns_list[i] is the function for pool slot i (each has its own buffers).
+
+    Each iter is timed individually with a per-iter sync. This is slower than
+    timing a batch of iters with one sync at the end, but it gives accurate
+    per-call latency (matches what a server actually pays per request) and
+    eliminates launch-queue variance that would otherwise inflate run-to-run
+    noise to 10-30%. We then take the median of `iters` per-iter latencies
+    within each repetition, and report the median across `repetitions`.
     """
     POOL = len(fns_list)
     for i in range(warmup):
         fns_list[i % POOL]()
     torch.xpu.synchronize()
-    t0 = time.perf_counter()
-    for i in range(iters):
-        fns_list[i % POOL]()
-    torch.xpu.synchronize()
-    return (time.perf_counter() - t0) / iters * 1000.0
+
+    rep_medians = []
+    for r in range(repetitions):
+        per_iter = []
+        for i in range(iters):
+            t0 = time.perf_counter()
+            fns_list[i % POOL]()
+            torch.xpu.synchronize()
+            per_iter.append((time.perf_counter() - t0) * 1000.0)
+        per_iter.sort()
+        rep_medians.append(per_iter[len(per_iter) // 2])
+    rep_medians.sort()
+    return rep_medians[len(rep_medians) // 2]
 
 
 # ---------------------------------------------------------------------------
@@ -494,6 +509,9 @@ def run_server(args, configs, backends):
         raise FileNotFoundError(f"Distribution file not found: {dist_file}")
 
     dist = parse_token_distribution(dist_file)
+    # 3072 tokens is the offline measurement point; exclude from server stats.
+    OFFLINE_TOKENS = 3072
+    dropped_offline = dist.pop(OFFLINE_TOKENS, 0)
     filtered = filter_distribution(dist, coverage=args.coverage)
 
     total_occurrences = sum(dist.values())
@@ -503,7 +521,8 @@ def run_server(args, configs, backends):
     print("=" * 110)
     print("Roofline Benchmark — SERVER MODE")
     print(f"E={E}, top_k={args.top_k}")
-    print(f"Distribution: {len(dist)} unique token counts, {total_occurrences} total occurrences")
+    print(f"Distribution: {len(dist)} unique token counts, {total_occurrences} total occurrences "
+          f"(dropped {dropped_offline} occurrences at tokens={OFFLINE_TOKENS} — offline-only)")
     print(f"After {args.coverage*100:.0f}% coverage filter: {num_m_values} M values, "
           f"{filtered_occurrences} occurrences ({filtered_occurrences/total_occurrences*100:.1f}%)")
     print(f"Peak INT8: {PEAK_INT8_TOPS} TOPS | Peak BF16: {PEAK_BF16_TFLOPS} TFLOPS | Peak BW: {PEAK_BW_GBS} GB/s")
@@ -621,7 +640,8 @@ def main():
                         choices=ALL_BACKENDS + ["all"],
                         help="Backend(s) to benchmark (default: onednn_w4a8 ipex_mxfp4; pass 'all' for full sweep)")
     parser.add_argument("--warmup", type=int, default=20)
-    parser.add_argument("--iters", type=int, default=100)
+    parser.add_argument("--iters", type=int, default=30,
+                        help="Per-iter timed calls (synced per iter). Default: 30.")
     parser.add_argument("--pool", type=int, default=4)
     parser.add_argument("--top-k", type=int, default=4, dest="top_k")
     parser.add_argument("--dist-file", type=str, default=None,
