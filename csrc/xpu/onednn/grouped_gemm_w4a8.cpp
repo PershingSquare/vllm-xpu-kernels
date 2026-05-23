@@ -92,10 +92,12 @@ torch::Tensor grouped_gemm_w4a8(
               "A_q must be uint8 for oneDNN grouped_gemm_w4a8");
   TORCH_CHECK(is_fp16_bf16_or_fp32(A_scale.scalar_type()),
               "A_scale must be fp16, bf16, or fp32");
-  TORCH_CHECK(A_zp.scalar_type() == at::ScalarType::Byte ||
-              A_zp.scalar_type() == at::ScalarType::Int ||
-              A_zp.scalar_type() == at::ScalarType::Long,
-              "A_zp must be uint8, int32, or int64");
+  TORCH_CHECK(A_scale.is_contiguous(),
+              "A_scale must be contiguous to skip per-call reshape");
+  TORCH_CHECK(A_zp.scalar_type() == at::ScalarType::Byte,
+              "A_zp must be uint8; convert at the call site to skip per-call dtype conversion");
+  TORCH_CHECK(A_zp.is_contiguous(),
+              "A_zp must be contiguous to skip per-call reshape");
   TORCH_CHECK(B_packed_u4.scalar_type() == at::ScalarType::Byte,
               "B_packed_u4 must be uint8 (pre-converted packed s4)");
   TORCH_CHECK(is_fp16_bf16_or_fp32(B_scales.scalar_type()),
@@ -158,37 +160,6 @@ torch::Tensor grouped_gemm_w4a8(
   const auto wei_scales_dt = to_onednn_type(B_scales.scalar_type());
   const auto src_zp_dt = dnnl::memory::data_type::u8;
 
-  const dnnl::memory::dim ngroups = static_cast<dnnl::memory::dim>(num_experts);
-  auto src_md = dnnl::memory::desc::grouped(
-      {total_M, K}, src_dt, 0, ngroups, dnnl::memory::data_type::s32);
-  auto dst_md = dnnl::memory::desc::grouped(
-      {total_M, N}, requested_dst_dt, 0, ngroups, dnnl::memory::data_type::s32);
-  auto wei_md = dnnl::memory::desc(
-      {num_experts, K, N}, dnnl::memory::data_type::s4, dnnl::memory::format_tag::acb);
-  auto wei_scales_md = dnnl::memory::desc(
-      {num_experts, static_cast<dnnl::memory::dim>(group_num), static_cast<dnnl::memory::dim>(N)},
-      wei_scales_dt, dnnl::memory::format_tag::abc);
-
-  torch::Tensor src_scales_onednn = A_scale.reshape({total_M}).contiguous();
-  auto src_scales_md = dnnl::memory::desc({total_M}, src_scales_dt, dnnl::memory::format_tag::a);
-
-  torch::Tensor src_zp_onednn =
-      (A_zp.scalar_type() == at::ScalarType::Byte ? A_zp : A_zp.to(at::ScalarType::Byte))
-          .reshape({total_M}).contiguous();
-  auto src_zp_md = dnnl::memory::desc({total_M}, src_zp_dt, dnnl::memory::format_tag::a);
-
-  dnnl::memory::desc bias_md;
-  if (bias.has_value()) {
-    const at::Tensor& b = *bias;
-    bias_md = dnnl::memory::desc(
-        {num_experts, N}, to_onednn_type(b.scalar_type()), {N, 1});
-  }
-
-  dnnl::primitive_attr attr;
-  attr.set_scales(DNNL_ARG_SRC, (1 << 0), {}, src_scales_dt);
-  attr.set_zero_points(DNNL_ARG_SRC, (1 << 0), {}, src_zp_dt);
-  attr.set_scales(DNNL_ARG_WEIGHTS, (1 << 0) | (1 << 1) | (1 << 2), {group_size, 1}, wei_scales_dt);
-
   const at::Device cur_device = A_q.device();
   const int device_id = cur_device.index();
   auto& engine = oneDNN::GpuEngineManager::Instance().get_engine(cur_device);
@@ -218,6 +189,33 @@ torch::Tensor grouped_gemm_w4a8(
   auto iter = primitive_cache.find(cache_key);
 
   if (iter == primitive_cache.end()) {
+    const dnnl::memory::dim ngroups = static_cast<dnnl::memory::dim>(num_experts);
+    auto src_md = dnnl::memory::desc::grouped(
+        {total_M, K}, src_dt, 0, ngroups, dnnl::memory::data_type::s32);
+    auto dst_md = dnnl::memory::desc::grouped(
+        {total_M, N}, requested_dst_dt, 0, ngroups, dnnl::memory::data_type::s32);
+    auto wei_md = dnnl::memory::desc({num_experts, K, N},
+        dnnl::memory::data_type::s4, dnnl::memory::format_tag::acb);
+    auto wei_scales_md = dnnl::memory::desc(
+        {num_experts, static_cast<dnnl::memory::dim>(group_num),
+         static_cast<dnnl::memory::dim>(N)},
+        wei_scales_dt, dnnl::memory::format_tag::abc);
+    auto src_scales_md = dnnl::memory::desc(
+        {total_M}, src_scales_dt, dnnl::memory::format_tag::a);
+    auto src_zp_md = dnnl::memory::desc(
+        {total_M}, src_zp_dt, dnnl::memory::format_tag::a);
+    dnnl::memory::desc bias_md;
+    if (bias.has_value()) {
+      bias_md = dnnl::memory::desc(
+          {num_experts, N}, to_onednn_type(bias->scalar_type()), {N, 1});
+    }
+
+    dnnl::primitive_attr attr;
+    attr.set_scales(DNNL_ARG_SRC, (1 << 0), {}, src_scales_dt);
+    attr.set_zero_points(DNNL_ARG_SRC, (1 << 0), {}, src_zp_dt);
+    attr.set_scales(DNNL_ARG_WEIGHTS, (1 << 0) | (1 << 1) | (1 << 2),
+        {group_size, 1}, wei_scales_dt);
+
     dnnl::matmul::primitive_desc pd;
     try {
       if (bias.has_value()) {
@@ -230,10 +228,15 @@ torch::Tensor grouped_gemm_w4a8(
                   "oneDNN grouped_gemm_w4a8: primitive_desc creation failed: ", e.what());
     }
     dnnl::matmul prim(pd);
-    iter = primitive_cache
-               .insert({cache_key,
-                        grouped_gemm_cached_primitive_t{std::move(pd), std::move(prim)}})
-               .first;
+    grouped_gemm_cached_primitive_t entry{std::move(pd), std::move(prim)};
+    entry.src_md = std::move(src_md);
+    entry.dst_md = std::move(dst_md);
+    entry.wei_md = std::move(wei_md);
+    entry.wei_scales_md = std::move(wei_scales_md);
+    entry.src_scales_md = std::move(src_scales_md);
+    entry.src_zp_md = std::move(src_zp_md);
+    entry.bias_md = std::move(bias_md);
+    iter = primitive_cache.insert({cache_key, std::move(entry)}).first;
   }
 
   // oneDNN grouped-memory expects expert-end offsets [num_experts].
@@ -258,19 +261,19 @@ torch::Tensor grouped_gemm_w4a8(
     auto hint_md = dnnl::memory::desc(
         {1}, dnnl::memory::data_type::s32, dnnl::memory::format_tag::a);
     cached.src_mem = dnnl::sycl_interop::make_memory(
-        src_md, engine, dnnl::sycl_interop::memory_kind::usm,
+        cached.src_md, engine, dnnl::sycl_interop::memory_kind::usm,
         std::vector<void*>{A_q.data_ptr(), expert_ends_i32.data_ptr()});
     cached.dst_mem = dnnl::sycl_interop::make_memory(
-        dst_md, engine, dnnl::sycl_interop::memory_kind::usm,
+        cached.dst_md, engine, dnnl::sycl_interop::memory_kind::usm,
         std::vector<void*>{D.data_ptr(), expert_ends_i32.data_ptr()});
     cached.wei_mem = oneDNN::make_onednn_memory(
-        wei_md, engine, B_packed_u4.data_ptr());
+        cached.wei_md, engine, B_packed_u4.data_ptr());
     cached.wei_scales_mem = oneDNN::make_onednn_memory(
-        wei_scales_md, engine, B_scales.data_ptr());
+        cached.wei_scales_md, engine, B_scales.data_ptr());
     cached.src_scales_mem = oneDNN::make_onednn_memory(
-        src_scales_md, engine, src_scales_onednn.data_ptr());
+        cached.src_scales_md, engine, A_scale.data_ptr());
     cached.src_zp_mem = oneDNN::make_onednn_memory(
-        src_zp_md, engine, src_zp_onednn.data_ptr());
+        cached.src_zp_md, engine, A_zp.data_ptr());
     cached.hint_mem = dnnl::sycl_interop::make_memory(
         hint_md, engine, dnnl::sycl_interop::memory_kind::usm,
         cached.hint_usm);
@@ -283,26 +286,22 @@ torch::Tensor grouped_gemm_w4a8(
     cached.args.emplace(DNNL_ARG_HINT_MAX_GROUP_SIZE, cached.hint_mem);
     if (bias.has_value()) {
       cached.bias_mem = oneDNN::make_onednn_memory(
-          bias_md, engine, bias->data_ptr());
+          cached.bias_md, engine, bias->data_ptr());
       cached.args.emplace(DNNL_ARG_BIAS, cached.bias_mem);
     }
     cached.memories_built = true;
   } else {
-    // Update pointers that change per call. Index 0 = main data buffer;
-    // index 1 = grouped-memory expert-end-offsets buffer.
     cached.src_mem.set_data_handle(A_q.data_ptr(), 0);
     cached.src_mem.set_data_handle(expert_ends_i32.data_ptr(), 1);
     cached.dst_mem.set_data_handle(D.data_ptr(), 0);
     cached.dst_mem.set_data_handle(expert_ends_i32.data_ptr(), 1);
-    cached.src_scales_mem.set_data_handle(src_scales_onednn.data_ptr());
-    cached.src_zp_mem.set_data_handle(src_zp_onednn.data_ptr());
+    cached.src_scales_mem.set_data_handle(A_scale.data_ptr());
+    cached.src_zp_mem.set_data_handle(A_zp.data_ptr());
     cached.wei_mem.set_data_handle(B_packed_u4.data_ptr());
     cached.wei_scales_mem.set_data_handle(B_scales.data_ptr());
     if (bias.has_value()) {
       cached.bias_mem.set_data_handle(bias->data_ptr());
     }
-    // hint_mem already wraps cached.hint_usm; the value at *hint_usm was
-    // updated above.
   }
 
   try {

@@ -95,6 +95,16 @@ struct grouped_gemm_cached_primitive_t {
   // PyTorch caching-allocator round-trip on each .to(Int) call.
   int32_t* offsets_i32_usm = nullptr;
   int offsets_i32_capacity = 0;
+  // Memory descriptors are functions of the cache key (pinned by shape +
+  // dtype + group_size) and never change for a given cache entry. Built
+  // once on cache miss; used to construct the dnnl::memory wrappers below.
+  dnnl::memory::desc src_md;
+  dnnl::memory::desc dst_md;
+  dnnl::memory::desc wei_md;
+  dnnl::memory::desc wei_scales_md;
+  dnnl::memory::desc src_scales_md;
+  dnnl::memory::desc src_zp_md;
+  dnnl::memory::desc bias_md;
   // Pre-built dnnl::memory wrappers and args map. data pointers
   // are updated per call via set_data_handle(); avoids 9x
   // make_memory + 9x unordered_map::emplace per call.
