@@ -574,9 +574,10 @@ def main():
                         help="Benchmark mode: offline (fixed M) or server (distribution-based)")
     parser.add_argument("--tp", type=str, choices=["4", "8", "both"], default="both",
                         help="Tensor parallelism: 4, 8, or both (default: both)")
-    parser.add_argument("--backend", type=str, nargs="+", default=["all"],
+    parser.add_argument("--backend", type=str, nargs="+",
+                        default=["onednn_w4a8", "ipex_mxfp4"],
                         choices=ALL_BACKENDS + ["all"],
-                        help="Backend(s) to benchmark (default: all)")
+                        help="Backend(s) to benchmark (default: onednn_w4a8 ipex_mxfp4; pass 'all' for full sweep)")
     parser.add_argument("--warmup", type=int, default=20)
     parser.add_argument("--iters", type=int, default=100)
     parser.add_argument("--pool", type=int, default=4)
