@@ -105,6 +105,12 @@ def build_offsets_from_distribution(token_counts, device):
     return torch.tensor(offsets, dtype=torch.int64, device=device)
 
 
+def count_active_experts(offsets) -> int:
+    """Count experts that have at least one token (count > 0) from cumulative offsets [E+1]."""
+    counts = offsets[1:] - offsets[:-1]
+    return int((counts > 0).sum().item())
+
+
 # ---------------------------------------------------------------------------
 # Cold-cache timing with rotating pool of pre-allocated buffers
 # ---------------------------------------------------------------------------
@@ -311,38 +317,33 @@ ONEDNN_BACKENDS = {"onednn_w4a8", "onednn_w4a16"}
 # Roofline analysis
 # ---------------------------------------------------------------------------
 
-def compute_bytes(total_M, N, K, E, group_size, backend):
-    """Compute total bytes transferred for a given backend."""
+def compute_bytes(total_M, N, K, e_active, group_size, backend):
     if backend == "onednn_w4a8":
-        # A is uint8 (1 byte), B is int4 (0.5 bytes), output bf16 (2 bytes)
-        bytes_a = total_M * K * 1          # uint8 activations
-        bytes_b = E * N * K // 2           # int4 weights
-        bytes_d = total_M * N * 2          # bf16 output
-        bytes_scales_w = E * (K // group_size) * N * 2  # bf16 weight scales
-        bytes_scales_a = total_M * 2       # bf16 per-token activation scales + zp (approx 2 bytes each)
+        bytes_a = total_M * K * 1
+        bytes_b = e_active * N * K // 2
+        bytes_d = total_M * N * 2
+        bytes_scales_w = e_active * (K // group_size) * N * 2
+        bytes_scales_a = total_M * 2
         return bytes_a + bytes_b + bytes_d + bytes_scales_w + bytes_scales_a
     elif backend in ("onednn_w4a16", "cutlass_w4a16", "ipex_int4"):
-        # A is bf16 (2 bytes), B is int4 (0.5 bytes), output bf16 (2 bytes)
-        bytes_a = total_M * K * 2          # bf16 activations
-        bytes_b = E * N * K // 2           # int4 weights
-        bytes_d = total_M * N * 2          # bf16 output
-        bytes_scales_w = E * (K // group_size) * N * 2  # bf16 weight scales
+        bytes_a = total_M * K * 2
+        bytes_b = e_active * N * K // 2
+        bytes_d = total_M * N * 2
+        bytes_scales_w = e_active * (K // group_size) * N * 2
         return bytes_a + bytes_b + bytes_d + bytes_scales_w
     elif backend in ("cutlass_mxfp4", "ipex_mxfp4"):
-        # A is bf16 (2 bytes), B is fp4 (0.5 bytes), scales uint8
         bytes_a = total_M * K * 2
-        bytes_b = E * N * K // 2
+        bytes_b = e_active * N * K // 2
         bytes_d = total_M * N * 2
-        bytes_scales_w = E * (K // group_size) * N * 1  # uint8 MX scales
+        bytes_scales_w = e_active * (K // group_size) * N * 1
         return bytes_a + bytes_b + bytes_d + bytes_scales_w
     else:
         raise ValueError(f"Unknown backend: {backend}")
 
 
-def roofline_stats(ms, total_M, N, K, E, group_size, backend):
-    """Compute roofline metrics for a given measurement."""
+def roofline_stats(ms, total_M, N, K, e_active, group_size, backend):
     flops = 2 * total_M * N * K
-    bytes_total = compute_bytes(total_M, N, K, E, group_size, backend)
+    bytes_total = compute_bytes(total_M, N, K, e_active, group_size, backend)
 
     achieved_ops_per_sec = flops / (ms * 1e-3)   # ops/sec
     achieved_gbs = bytes_total / (ms * 1e-3) / 1e9
@@ -411,20 +412,20 @@ def filter_distribution(dist, coverage=0.95):
 # ---------------------------------------------------------------------------
 
 def run_benchmark(total_M, N, K, E, group_size, top_k, backend, warmup, iters, POOL):
-    """Run a single benchmark and return latency in ms."""
     token_counts = scale_tokens_to_M(REAL_EXPERT_TOKENS, total_M)
     offsets = build_offsets_from_distribution(token_counts, DEVICE)
     max_expert_size = (total_M + top_k - 1) // top_k
+    e_active = count_active_experts(offsets)
 
     try:
         if backend in ONEDNN_BACKENDS:
             ms = RUNNERS[backend](total_M, N, K, E, group_size, offsets, max_expert_size, warmup, iters, POOL)
         else:
             ms = RUNNERS[backend](total_M, N, K, E, group_size, offsets, warmup, iters, POOL)
-        return ms
+        return ms, e_active
     except Exception as e:
         print(f"  {backend}: FAILED - {str(e)[:80]}")
-        return None
+        return None, e_active
     finally:
         gc.collect()
 
@@ -452,9 +453,9 @@ def run_offline(args, configs, backends):
     for label, cfg in configs:
         N, K, group_size = cfg["N"], cfg["K"], cfg["group_size"]
         for backend in backends:
-            ms = run_benchmark(total_M, N, K, E, group_size, args.top_k, backend, args.warmup, args.iters, args.pool)
+            ms, e_active = run_benchmark(total_M, N, K, E, group_size, args.top_k, backend, args.warmup, args.iters, args.pool)
             if ms is not None:
-                tops, bw, ai, bound, roofline_pct = roofline_stats(ms, total_M, N, K, E, group_size, backend)
+                tops, bw, ai, bound, roofline_pct = roofline_stats(ms, total_M, N, K, e_active, group_size, backend)
                 print(f"{label:<12} | {backend:<16} | {total_M:>6} | {ms:>8.3f} | "
                       f"{tops:>11.2f} | {bw:>9.1f} | {ai:>7.2f} | {bound:<8} | {roofline_pct:>8.1f}%")
             else:
@@ -519,13 +520,13 @@ def run_server(args, configs, backends):
                 total_M = tokens * args.top_k
                 if total_M < 1:
                     continue
-                ms = run_benchmark(total_M, N, K, E, group_size, args.top_k, backend, args.warmup, args.iters, args.pool)
+                ms, e_active = run_benchmark(total_M, N, K, E, group_size, args.top_k, backend, args.warmup, args.iters, args.pool)
                 weight = m_weights[tokens]
                 if ms is not None:
-                    tops, bw, ai, bound, roofline_pct = roofline_stats(ms, total_M, N, K, E, group_size, backend)
+                    tops, bw, ai, bound, roofline_pct = roofline_stats(ms, total_M, N, K, e_active, group_size, backend)
                     print(f"{label:<12} | {backend:<16} | {total_M:>6} | {ms:>8.3f} | "
                           f"{tops:>11.2f} | {bw:>9.1f} | {ai:>7.2f} | {bound:<8} | {roofline_pct:>8.1f}%")
-                    all_results[key].append((ms, total_M, weight))
+                    all_results[key].append((ms, total_M, weight, e_active))
                 else:
                     print(f"{label:<12} | {backend:<16} | {total_M:>6} | {'FAILED':>8} | "
                           f"{'—':>11} | {'—':>9} | {'—':>7} | {'—':<8} | {'—':>9}")
@@ -549,13 +550,13 @@ def run_server(args, configs, backends):
                       f"{'—':>11} | {'—':>9} | {'—':>7} | {'—':<8} | {'—':>9}")
                 continue
 
-            total_weight = sum(w for _, _, w in entries)
-            weighted_ms = sum(ms * w for ms, _, w in entries) / total_weight
-            weighted_M = sum(m * w for _, m, w in entries) / total_weight
+            total_weight = sum(w for _, _, w, _ in entries)
+            weighted_ms = sum(ms * w for ms, _, w, _ in entries) / total_weight
+            weighted_M = sum(m * w for _, m, w, _ in entries) / total_weight
             avg_M = int(round(weighted_M))
+            avg_e_active = int(round(sum(ea * w for _, _, w, ea in entries) / total_weight))
 
-            # Compute roofline stats at weighted-average M
-            tops, bw, ai, bound, roofline_pct = roofline_stats(weighted_ms, avg_M, N, K, E, group_size, backend)
+            tops, bw, ai, bound, roofline_pct = roofline_stats(weighted_ms, avg_M, N, K, avg_e_active, group_size, backend)
             print(f"{label:<12} | {backend:<16} | {avg_M:>6} | {weighted_ms:>8.3f} | "
                   f"{tops:>11.2f} | {bw:>9.1f} | {ai:>7.2f} | {bound:<8} | {roofline_pct:>8.1f}%")
 
