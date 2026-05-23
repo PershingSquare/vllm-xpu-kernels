@@ -70,6 +70,14 @@ def scale_tokens_to_M(tokens, M):
     return scaled.tolist()
 
 
+def scale_tokens_uniform(M, E):
+    """Distribute M tokens evenly across E experts."""
+    base = M // E
+    rem = M % E
+    counts = [base + (1 if i < rem else 0) for i in range(E)]
+    return counts
+
+
 def clear_xpu_cache():
     torch.xpu.synchronize()
     gc.collect()
@@ -411,8 +419,11 @@ def filter_distribution(dist, coverage=0.95):
 # Run benchmark for a single (config, backend, M) combination
 # ---------------------------------------------------------------------------
 
-def run_benchmark(total_M, N, K, E, group_size, top_k, backend, warmup, iters, POOL):
-    token_counts = scale_tokens_to_M(REAL_EXPERT_TOKENS, total_M)
+def run_benchmark(total_M, N, K, E, group_size, top_k, backend, warmup, iters, POOL, token_dist="real"):
+    if token_dist == "real":
+        token_counts = scale_tokens_to_M(REAL_EXPERT_TOKENS, total_M)
+    else:
+        token_counts = scale_tokens_uniform(total_M, E)
     offsets = build_offsets_from_distribution(token_counts, DEVICE)
     max_expert_size = (total_M + top_k - 1) // top_k
     e_active = count_active_experts(offsets)
@@ -520,7 +531,7 @@ def run_server(args, configs, backends):
                 total_M = tokens * args.top_k
                 if total_M < 1:
                     continue
-                ms, e_active = run_benchmark(total_M, N, K, E, group_size, args.top_k, backend, args.warmup, args.iters, args.pool)
+                ms, e_active = run_benchmark(total_M, N, K, E, group_size, args.top_k, backend, args.warmup, args.iters, args.pool, args.token_dist)
                 weight = m_weights[tokens]
                 if ms is not None:
                     tops, bw, ai, bound, roofline_pct = roofline_stats(ms, total_M, N, K, e_active, group_size, backend)
@@ -560,6 +571,36 @@ def run_server(args, configs, backends):
             print(f"{label:<12} | {backend:<16} | {avg_M:>6} | {weighted_ms:>8.3f} | "
                   f"{tops:>11.2f} | {bw:>9.1f} | {ai:>7.2f} | {bound:<8} | {roofline_pct:>8.1f}%")
 
+    # Tokens-bucket summary
+    BUCKETS = [
+        ("tokens<32",    lambda tm: tm < 128),
+        ("tokens 32-128", lambda tm: 128 <= tm < 512),
+        ("tokens 128-512", lambda tm: 512 <= tm < 2048),
+        ("tokens>=512",  lambda tm: tm >= 2048),
+    ]
+    print()
+    print("=" * 110)
+    print("=== Tokens-Bucket Summary ===")
+    print("=" * 110)
+    print(header)
+    print("-" * len(header))
+    for bucket_label, bucket_fn in BUCKETS:
+        for label, cfg in configs:
+            N, K, group_size = cfg["N"], cfg["K"], cfg["group_size"]
+            for backend in backends:
+                key = (label, backend)
+                entries = [e for e in all_results.get(key, []) if bucket_fn(e[1])]
+                if not entries:
+                    continue
+                total_weight = sum(w for _, _, w, _ in entries)
+                weighted_ms = sum(ms * w for ms, _, w, _ in entries) / total_weight
+                weighted_M = sum(m * w for _, m, w, _ in entries) / total_weight
+                avg_M = int(round(weighted_M))
+                avg_e_active = int(round(sum(ea * w for _, _, w, ea in entries) / total_weight))
+                tops, bw, ai, bound, roofline_pct = roofline_stats(weighted_ms, avg_M, N, K, avg_e_active, group_size, backend)
+                print(f"{label:<12} | {backend:<16} | {avg_M:>6} | {weighted_ms:>8.3f} | "
+                      f"{tops:>11.2f} | {bw:>9.1f} | {ai:>7.2f} | {bound:<8} | {roofline_pct:>8.1f}% | {bucket_label}")
+
     print()
     print("Done.")
 
@@ -587,6 +628,8 @@ def main():
                         help="Path to token distribution markdown file (default: auto-find)")
     parser.add_argument("--coverage", type=float, default=0.95,
                         help="Fraction of mass to keep for server mode (default: 0.95)")
+    parser.add_argument("--token-dist", type=str, choices=["real", "uniform"], default="real",
+                        help="Token distribution across experts: real (REAL_EXPERT_TOKENS) or uniform (default: real)")
     args = parser.parse_args()
 
     backends = ALL_BACKENDS if "all" in args.backend else args.backend
