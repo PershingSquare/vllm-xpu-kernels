@@ -236,12 +236,12 @@ torch::Tensor grouped_gemm_w4a8(
                .first;
   }
 
-  torch::Tensor expert_ends_i32 = torch::empty(
-      {num_experts + 1},
-      expert_first_token_offset_i32.options().dtype(at::ScalarType::Int));
-  expert_ends_i32.narrow(0, 0, num_experts)
-      .copy_(expert_first_token_offset_i32.narrow(0, 1, num_experts));
-  expert_ends_i32.narrow(0, num_experts, 1).fill_(static_cast<int>(total_M));
+  // oneDNN grouped-memory expects expert-end offsets [num_experts].
+  // expert_first_token_offset_i32 has shape [num_experts+1] with
+  // [0, end_e0, ..., total_M], so a view at offset 1 is the ends array.
+  // Avoids a per-call alloc + copy + fill on the device.
+  torch::Tensor expert_ends_i32 =
+      expert_first_token_offset_i32.narrow(0, 1, num_experts);
 
   auto src_mem = dnnl::sycl_interop::make_memory(
       src_md, engine, dnnl::sycl_interop::memory_kind::usm,
