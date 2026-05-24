@@ -9,6 +9,7 @@
 #include <utility>
 
 #include <dnnl.hpp>
+#include <oneapi/dnnl/dnnl_sycl.hpp>
 
 namespace oneDNN {
 
@@ -118,6 +119,10 @@ struct grouped_gemm_cached_primitive_t {
   dnnl::memory hint_mem;
   dnnl::memory bias_mem;
   std::unordered_map<int, dnnl::memory> args;
+  // Cached fast-path execute handle (lazily built once memories+args are
+  // populated). Skips per-call argument conversion, validation, hooks, and
+  // grantor allocation inside oneDNN.
+  dnnl::sycl_interop::execute_handle exec_handle;
 };
 
 using grouped_gemm_primitive_cache = at::native::onednn::lru_cache<

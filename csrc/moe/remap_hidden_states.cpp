@@ -213,8 +213,6 @@ class RemapHiddenStates {
       }
     }
 
-    item.barrier(sycl::access::fence_space::local_space);
-
     auto hidden_states_base = hidden_states +
                               row * static_cast<int64_t>(hidden_size) +
                               local_id * ElemsPerItem;

@@ -446,6 +446,8 @@ if(BASIC_KERNELS_ENABLED)
       "csrc/torch_bindings.cpp"
       "csrc/quantization/fp8/fp8_quant.cpp"
       "csrc/quantization/fp4/mxfp4_quant.cpp"
+      "csrc/quantization/int8/int8_quant.cpp"
+      "csrc/quantization/int8/silu_and_mul_quant.cpp"
       "csrc/xpu_view.cpp"
       "csrc/attention/merge_attn_states.cpp"
       "csrc/tensor_utils.cpp"

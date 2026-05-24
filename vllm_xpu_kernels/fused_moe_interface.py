@@ -17,7 +17,27 @@ def _use_w4a8() -> bool:
 
 
 def _dynamic_per_token_quant_int8(x: torch.Tensor):
-    """Per-token asymmetric uint8 quantization. scale=(max-min)/255, zp=round(-min/scale), output in [0,255]."""
+    """Per-token asymmetric uint8 quant: scale=(max-min)/255, zp=round(-min/scale), q in [0,255].
+
+    Uses the fused SYCL kernel `torch.ops._C.dynamic_per_token_quant_int8_asym`
+    when available (single kernel launch on XPU); falls back to a 5-torch-op
+    chain for portability.
+    """
+    fused = getattr(torch.ops._C, "dynamic_per_token_quant_int8_asym", None)
+    if fused is not None and x.dtype in (torch.bfloat16, torch.float16):
+        d = x.shape[-1]
+        x_flat = x.reshape(-1, d).contiguous()
+        n = x_flat.shape[0]
+        q = torch.empty_like(x_flat, dtype=torch.uint8)
+        s = torch.empty(n, dtype=x.dtype, device=x.device)
+        z = torch.empty(n, dtype=torch.uint8, device=x.device)
+        fused(q, s, z, x_flat)
+        return (
+            q.reshape(x.shape),
+            s.reshape(x.shape[:-1] + (1,)),
+            z.reshape(x.shape[:-1] + (1,)),
+        )
+
     flat = x.reshape(-1, x.shape[-1])
     min_val = flat.to(torch.float32).min(dim=-1)[0].unsqueeze(-1)
     max_val = flat.to(torch.float32).max(dim=-1)[0].unsqueeze(-1)
@@ -286,49 +306,70 @@ def xpu_fused_moe(hidden_states,
             max_expert_size=max_expert_size)
 
     inter_size_scale = 2 if activation == "relu2_no_mul" else 1
-    act_output = torch.empty((num_moe_inputs, inter_size * inter_size_scale),
-                             dtype=gemm1_output.dtype,
-                             device=gemm1_output.device)
-    if activation == "silu":
-        torch.ops._C.silu_and_mul(act_output, gemm1_output)
-    elif activation == "gelu":
-        torch.ops._C.gelu_and_mul(act_output, gemm1_output)
-    elif activation == "swigluoai" or ("SWIGLUOAI" in str(activation)):
-        torch.ops._C.swigluoai_and_mul(act_output, gemm1_output, 1.702, 7.0)
-    elif activation == "relu2_no_mul":
-        torch.ops._C.relu2_no_mul(act_output, gemm1_output)
-    elif activation == "swiglustep":
-        torch.ops._C.swiglustep_and_mul(act_output, gemm1_output, 7.0)
-    else:
-        raise ValueError(f"Unsupported FusedMoe activation: {activation}.")
+    is_swigluoai = (activation == "swigluoai" or
+                    ("SWIGLUOAI" in str(activation)))
+    fused_act_quant_op = getattr(torch.ops._C,
+                                 "swigluoai_and_mul_quant_int8_asym", None)
+    can_fuse_act_quant = (using_w4a8 and is_swigluoai
+                          and inter_size_scale == 1
+                          and fused_act_quant_op is not None)
 
-    input_A = act_output.contiguous()
     input_B = w2
     gemm2_output = torch.empty((num_moe_inputs, hidden_size),
                                 dtype=hidden_states.dtype,
                                 device=hidden_states.device)
 
-    if using_w4a8:
-        A_q2, A_scale2, A_zp2 = _dynamic_per_token_quant_int8(input_A)
+    if can_fuse_act_quant:
+        A_q2 = torch.empty((num_moe_inputs, inter_size),
+                           dtype=torch.uint8, device=gemm1_output.device)
+        A_scale2 = torch.empty(num_moe_inputs, dtype=gemm1_output.dtype,
+                               device=gemm1_output.device)
+        A_zp2 = torch.empty(num_moe_inputs, dtype=torch.uint8,
+                            device=gemm1_output.device)
+        fused_act_quant_op(A_q2, A_scale2, A_zp2, gemm1_output, 1.702, 7.0)
         torch.ops._xpu_C.onednn_grouped_gemm_w4a8(
-            A_q2, A_scale2.reshape(-1), A_zp2.reshape(-1),
+            A_q2, A_scale2, A_zp2,
             input_B, gemm2_scales, w2_bias,
             gemm2_output, expert_first_token_offset,
-            hidden_size, inter_size * inter_size_scale, num_experts, max_expert_size)
+            hidden_size, inter_size, num_experts, max_expert_size)
     else:
-        torch.ops._xpu_C.grouped_gemm_interface(
-            ptr_A=input_A,
-            ptr_B=input_B,
-            ptr_scales=gemm2_scales,
-            ptr_bias=w2_bias,
-            ptr_D=gemm2_output,
-            expert_first_token_offset=expert_first_token_offset,
-            N=hidden_size,
-            K=inter_size * inter_size_scale,
-            num_experts=num_experts,
-            is_B_int4=is_int4,
-            is_B_mxfp4=is_mxfp4,
-            max_expert_size=max_expert_size)
+        act_output = torch.empty(
+            (num_moe_inputs, inter_size * inter_size_scale),
+            dtype=gemm1_output.dtype, device=gemm1_output.device)
+        if activation == "silu":
+            torch.ops._C.silu_and_mul(act_output, gemm1_output)
+        elif activation == "gelu":
+            torch.ops._C.gelu_and_mul(act_output, gemm1_output)
+        elif is_swigluoai:
+            torch.ops._C.swigluoai_and_mul(act_output, gemm1_output, 1.702, 7.0)
+        elif activation == "relu2_no_mul":
+            torch.ops._C.relu2_no_mul(act_output, gemm1_output)
+        elif activation == "swiglustep":
+            torch.ops._C.swiglustep_and_mul(act_output, gemm1_output, 7.0)
+        else:
+            raise ValueError(f"Unsupported FusedMoe activation: {activation}.")
+        input_A = act_output.contiguous()
+        if using_w4a8:
+            A_q2, A_scale2, A_zp2 = _dynamic_per_token_quant_int8(input_A)
+            torch.ops._xpu_C.onednn_grouped_gemm_w4a8(
+                A_q2, A_scale2.reshape(-1), A_zp2.reshape(-1),
+                input_B, gemm2_scales, w2_bias,
+                gemm2_output, expert_first_token_offset,
+                hidden_size, inter_size * inter_size_scale, num_experts, max_expert_size)
+        else:
+            torch.ops._xpu_C.grouped_gemm_interface(
+                ptr_A=input_A,
+                ptr_B=input_B,
+                ptr_scales=gemm2_scales,
+                ptr_bias=w2_bias,
+                ptr_D=gemm2_output,
+                expert_first_token_offset=expert_first_token_offset,
+                N=hidden_size,
+                K=inter_size * inter_size_scale,
+                num_experts=num_experts,
+                is_B_int4=is_int4,
+                is_B_mxfp4=is_mxfp4,
+                max_expert_size=max_expert_size)
 
     torch.ops._moe_C.moe_gather(output, gemm2_output, topk_weights,
                                 unpermuted_row_to_permuted_row,

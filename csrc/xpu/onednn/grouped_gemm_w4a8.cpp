@@ -290,6 +290,8 @@ torch::Tensor grouped_gemm_w4a8(
       cached.args.emplace(DNNL_ARG_BIAS, cached.bias_mem);
     }
     cached.memories_built = true;
+    cached.exec_handle = dnnl::sycl_interop::execute_handle(
+        cached.prim, stream, cached.args);
   } else {
     cached.src_mem.set_data_handle(A_q.data_ptr(), 0);
     cached.src_mem.set_data_handle(expert_ends_i32.data_ptr(), 1);
@@ -305,7 +307,7 @@ torch::Tensor grouped_gemm_w4a8(
   }
 
   try {
-    (void)dnnl::sycl_interop::execute(cached.prim, stream, cached.args);
+    (void)dnnl::sycl_interop::execute_fast(cached.exec_handle);
   } catch (const dnnl::error& e) {
     TORCH_CHECK(false, "oneDNN grouped_gemm_w4a8: execute failed: ", e.what());
   }

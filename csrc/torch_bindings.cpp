@@ -138,6 +138,24 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
       torch::kXPU,
       &dynamic_per_token_scaled_fp8_quant);
 
+  // Compute dynamic per-token asymmetric uint8 quantization with zero point.
+  ops.def(
+      "dynamic_per_token_quant_int8_asym(Tensor! out_q, Tensor! out_scale, "
+      "Tensor! out_zp, Tensor input) -> ()");
+  ops.impl(
+      "dynamic_per_token_quant_int8_asym",
+      torch::kXPU,
+      &dynamic_per_token_quant_int8_asym);
+
+  // Compute fused swigluoai_and_mul + dynamic per-token int8 quant.
+  ops.def(
+      "swigluoai_and_mul_quant_int8_asym(Tensor! out_q, Tensor! out_scale, "
+      "Tensor! out_zp, Tensor input, float alpha, float limit) -> ()");
+  ops.impl(
+      "swigluoai_and_mul_quant_int8_asym",
+      torch::kXPU,
+      &swigluoai_and_mul_quant_int8_asym);
+
   // Compute per-token-group FP8 quantized tensor and scaling factor.
   ops.def(
       "per_token_group_fp8_quant(Tensor input, Tensor! output_q, Tensor! "

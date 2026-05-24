@@ -171,6 +171,20 @@ void dynamic_per_token_scaled_fp8_quant(
     torch::Tensor& scales,
     std::optional<at::Tensor> const& scale_ub);
 
+void dynamic_per_token_quant_int8_asym(
+    torch::Tensor& out_q,
+    torch::Tensor& out_scale,
+    torch::Tensor& out_zp,
+    torch::Tensor const& input);
+
+void swigluoai_and_mul_quant_int8_asym(
+    torch::Tensor& out_q,
+    torch::Tensor& out_scale,
+    torch::Tensor& out_zp,
+    torch::Tensor const& input,
+    double alpha,
+    double limit);
+
 void per_token_group_quant_fp8(
     const torch::Tensor& input,
     torch::Tensor& output_q,
