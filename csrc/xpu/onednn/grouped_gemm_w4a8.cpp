@@ -306,10 +306,29 @@ torch::Tensor grouped_gemm_w4a8(
     }
   }
 
-  try {
-    (void)dnnl::sycl_interop::execute_fast(cached.exec_handle);
-  } catch (const dnnl::error& e) {
-    TORCH_CHECK(false, "oneDNN grouped_gemm_w4a8: execute failed: ", e.what());
+  if (cached.use_fast_path) {
+    try {
+      (void)dnnl::sycl_interop::execute_fast(cached.exec_handle);
+    } catch (const dnnl::error& fast_err) {
+      if (fast_err.status == dnnl_unimplemented) {
+        cached.use_fast_path = false;
+      } else {
+        TORCH_CHECK(false, "oneDNN grouped_gemm_w4a8: execute_fast failed: ",
+                    fast_err.what());
+      }
+    } catch (...) {
+      throw;
+    }
+  }
+  if (!cached.use_fast_path) {
+    // Slow path: regular execute() for unsupported shapes (token-centric etc.)
+    try {
+      cached.prim.execute(stream, cached.args);
+    } catch (const dnnl::error& e) {
+      TORCH_CHECK(false, "oneDNN grouped_gemm_w4a8: execute slow failed: ", e.what());
+    } catch (...) {
+      throw;
+    }
   }
 
   return D;

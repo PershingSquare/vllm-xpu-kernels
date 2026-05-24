@@ -110,6 +110,7 @@ struct grouped_gemm_cached_primitive_t {
   // are updated per call via set_data_handle(); avoids 9x
   // make_memory + 9x unordered_map::emplace per call.
   bool memories_built = false;
+  bool use_fast_path = true; // set to false if execute_fast fails
   dnnl::memory src_mem;
   dnnl::memory dst_mem;
   dnnl::memory wei_mem;
