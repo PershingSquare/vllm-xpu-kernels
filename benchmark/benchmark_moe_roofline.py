@@ -128,30 +128,28 @@ def bench_cold(fns_list, warmup, iters, repetitions=3):
 
     fns_list[i] is the function for pool slot i (each has its own buffers).
 
-    Each iter is timed individually with a per-iter sync. This is slower than
-    timing a batch of iters with one sync at the end, but it gives accurate
-    per-call latency (matches what a server actually pays per request) and
-    eliminates launch-queue variance that would otherwise inflate run-to-run
-    noise to 10-30%. We then take the median of `iters` per-iter latencies
-    within each repetition, and report the median across `repetitions`.
+    Uses batch-async timing: iters kernels are queued without syncing between
+    them, mirroring how vLLM queues MoE ops to the SYCL command queue in
+    production (CPU stays ahead of GPU; host dispatch is hidden by the async
+    queue). A single torch.xpu.synchronize() at the end gates the wall time.
+
+    To reduce run-to-run variance, `repetitions` independent batch runs are
+    taken and the median is reported.
     """
     POOL = len(fns_list)
     for i in range(warmup):
         fns_list[i % POOL]()
     torch.xpu.synchronize()
 
-    rep_medians = []
-    for r in range(repetitions):
-        per_iter = []
+    rep_results = []
+    for _ in range(repetitions):
+        t0 = time.perf_counter()
         for i in range(iters):
-            t0 = time.perf_counter()
             fns_list[i % POOL]()
-            torch.xpu.synchronize()
-            per_iter.append((time.perf_counter() - t0) * 1000.0)
-        per_iter.sort()
-        rep_medians.append(per_iter[len(per_iter) // 2])
-    rep_medians.sort()
-    return rep_medians[len(rep_medians) // 2]
+        torch.xpu.synchronize()
+        rep_results.append((time.perf_counter() - t0) / iters * 1000.0)
+    rep_results.sort()
+    return rep_results[len(rep_results) // 2]
 
 
 # ---------------------------------------------------------------------------
@@ -651,8 +649,8 @@ def main():
                         choices=ALL_BACKENDS + ["all"],
                         help="Backend(s) to benchmark (default: onednn_w4a8 ipex_mxfp4; pass 'all' for full sweep)")
     parser.add_argument("--warmup", type=int, default=20)
-    parser.add_argument("--iters", type=int, default=30,
-                        help="Per-iter timed calls (synced per iter). Default: 30.")
+    parser.add_argument("--iters", type=int, default=100,
+                        help="Kernel calls per batch-async timing rep. Default: 100.")
     parser.add_argument("--pool", type=int, default=4)
     parser.add_argument("--top-k", type=int, default=4, dest="top_k")
     parser.add_argument("--dist-file", type=str, default=None,
