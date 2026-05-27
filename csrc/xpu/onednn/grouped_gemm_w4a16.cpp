@@ -1,8 +1,8 @@
-#include "csrc/xpu/onednn/grouped_gemm_w4a16.h"
+#include "xpu/onednn/grouped_gemm_w4a16.h"
 
-#include "csrc/utils.h"
-#include "csrc/xpu/onednn/onednn_grouped_gemm_cache.h"
-#include "csrc/xpu/onednn/onednn_runtime.h"
+#include "utils.h"
+#include "xpu/onednn/onednn_grouped_gemm_cache.h"
+#include "xpu/onednn/onednn_runtime.h"
 
 #include <cstdint>
 #include <exception>
@@ -83,11 +83,13 @@ torch::Tensor grouped_gemm_w4a16(
   TORCH_CHECK(ptr_D.scalar_type() == A_dtype, "ptr_D dtype must match ptr_A");
   TORCH_CHECK(ptr_B.scalar_type() == at::ScalarType::Byte,
               "ptr_B must be uint8 (pre-converted packed s4)");
-  TORCH_CHECK(expert_first_token_offset.scalar_type() == at::ScalarType::Long,
-              "expert_first_token_offset must be int64");
+  TORCH_CHECK(expert_first_token_offset.scalar_type() == at::ScalarType::Long ||
+              expert_first_token_offset.scalar_type() == at::ScalarType::Int,
+              "expert_first_token_offset must be int64 or int32");
 
   const int64_t total_M = ptr_A.size(0);
   TORCH_CHECK(total_M <= std::numeric_limits<int>::max(), "total_M exceeds int32 range");
+
   TORCH_CHECK(ptr_A.size(1) == K, "ptr_A.size(1) must match K");
   TORCH_CHECK(ptr_B.size(0) == num_experts, "ptr_B.size(0) must match num_experts");
   TORCH_CHECK(ptr_B.size(1) == N, "ptr_B.size(1) must match N");
@@ -97,7 +99,8 @@ torch::Tensor grouped_gemm_w4a16(
   TORCH_CHECK(expert_first_token_offset.numel() == (num_experts + 1),
               "expert_first_token_offset must have length E+1");
 
-  TORCH_CHECK(ptr_scales.has_value(), "w4a16 grouped GEMM must have scales");
+  const bool has_scales = ptr_scales.has_value() && ptr_scales->defined();
+  TORCH_CHECK(has_scales, "w4a16 grouped GEMM must have scales");
   const at::Tensor& scales = *ptr_scales;
   CHECK_DEVICE(scales); CHECK_CONTIGUOUS(scales);
   TORCH_CHECK(scales.dim() == 3, "ptr_scales must be 3D [E, G, N] (pre-permuted)");
@@ -111,7 +114,9 @@ torch::Tensor grouped_gemm_w4a16(
   TORCH_CHECK((K % 2) == 0, "K must be even for int4 weights");
   TORCH_CHECK((N % 2) == 0, "N must be even for int4 weights");
 
-  if (ptr_bias.has_value()) {
+  const bool has_bias = ptr_bias.has_value() && ptr_bias->defined();
+
+  if (has_bias) {
     const at::Tensor& bias = *ptr_bias;
     CHECK_DEVICE(bias); CHECK_CONTIGUOUS(bias);
     TORCH_CHECK(bias.dim() == 2, "ptr_bias must be 2D [E, N]");
@@ -141,7 +146,7 @@ torch::Tensor grouped_gemm_w4a16(
       {num_experts, group_num, N}, scales_dt, dnnl::memory::format_tag::abc);
 
   dnnl::memory::desc bias_md;
-  if (ptr_bias.has_value()) {
+  if (has_bias) {
     const at::Tensor& bias = *ptr_bias;
     bias_md = dnnl::memory::desc(
         {num_experts, N}, to_onednn_type(bias.scalar_type()), {N, 1});
@@ -152,7 +157,6 @@ torch::Tensor grouped_gemm_w4a16(
                   (1 << 0) | (1 << 1) | (1 << 2),
                   {group_size, 1},
                   scales_dt);
-
   const at::Device cur_device = ptr_A.device();
   const int device_id = cur_device.index();
   auto& engine = oneDNN::GpuEngineManager::Instance().get_engine(cur_device);
@@ -165,8 +169,8 @@ torch::Tensor grouped_gemm_w4a16(
   cache_key.dst_dtype = static_cast<int64_t>(dst_dt);
   cache_key.src_scales_dtype = static_cast<int64_t>(dnnl::memory::data_type::undef);
   cache_key.wei_scales_dtype = static_cast<int64_t>(scales_dt);
-  cache_key.bias_dtype = ptr_bias.has_value()
-      ? static_cast<int64_t>(to_onednn_type(ptr_bias.value().scalar_type()))
+  cache_key.bias_dtype = has_bias
+      ? static_cast<int64_t>(to_onednn_type(ptr_bias->scalar_type()))
       : static_cast<int64_t>(dnnl::memory::data_type::undef);
   cache_key.requested_dst_dtype = static_cast<int64_t>(dst_dt);
   cache_key.total_m = total_M;
@@ -175,7 +179,7 @@ torch::Tensor grouped_gemm_w4a16(
   cache_key.num_experts = num_experts;
   cache_key.group_num = group_num;
   cache_key.group_size = group_size;
-  cache_key.has_bias = ptr_bias.has_value() ? 1 : 0;
+  cache_key.has_bias = has_bias ? 1 : 0;
   cache_key.max_expert_size = max_expert_size;
 
   auto& primitive_cache = get_grouped_gemm_primitive_cache(device_id);
@@ -183,7 +187,7 @@ torch::Tensor grouped_gemm_w4a16(
   if (iter == primitive_cache.end()) {
     dnnl::matmul::primitive_desc pd;
     try {
-      if (ptr_bias.has_value()) {
+      if (has_bias) {
         pd = dnnl::matmul::primitive_desc(engine, src_md, wei_md, bias_md, dst_md, attr);
       } else {
         pd = dnnl::matmul::primitive_desc(engine, src_md, wei_md, dst_md, attr);
@@ -212,56 +216,92 @@ torch::Tensor grouped_gemm_w4a16(
       throw;
     }
 
-    iter = primitive_cache
-               .insert({cache_key,
-                        grouped_gemm_cached_primitive_t{std::move(pd), std::move(prim)}})
-               .first;
+    grouped_gemm_cached_primitive_t entry{std::move(pd), std::move(prim)};
+    entry.src_md = std::move(src_md);
+    entry.dst_md = std::move(dst_md);
+    entry.wei_md = std::move(wei_md);
+    entry.wei_scales_md = std::move(scales_md);
+    entry.bias_md = std::move(bias_md);
+    iter = primitive_cache.insert({cache_key, std::move(entry)}).first;
   }
 
-  torch::Tensor expert_ends_i32 = torch::empty(
-      {num_experts + 1},
-      expert_first_token_offset_i32.options().dtype(at::ScalarType::Int));
-  expert_ends_i32.narrow(0, 0, num_experts)
-      .copy_(expert_first_token_offset_i32.narrow(0, 1, num_experts));
-  expert_ends_i32.narrow(0, num_experts, 1).fill_(static_cast<int>(total_M));
+  // oneDNN grouped-memory expects expert-end offsets [num_experts].
+  torch::Tensor expert_ends_i32 =
+      expert_first_token_offset_i32.narrow(0, 1, num_experts);
 
-  auto src_mem = dnnl::sycl_interop::make_memory(
-      src_md, engine, dnnl::sycl_interop::memory_kind::usm,
-      std::vector<void*>{ptr_A.data_ptr(), expert_ends_i32.data_ptr()});
-  auto dst_mem = dnnl::sycl_interop::make_memory(
-      dst_md, engine, dnnl::sycl_interop::memory_kind::usm,
-      std::vector<void*>{ptr_D.data_ptr(), expert_ends_i32.data_ptr()});
-  auto wei_mem = oneDNN::make_onednn_memory(wei_md, engine, ptr_B.data_ptr());
-  auto scales_mem = oneDNN::make_onednn_memory(scales_md, engine, scales.data_ptr());
+  auto& cached = iter->second;
 
-  std::unordered_map<int, dnnl::memory> args;
-  args.emplace(DNNL_ARG_SRC, std::move(src_mem));
-  args.emplace(DNNL_ARG_WEIGHTS, std::move(wei_mem));
-  args.emplace(DNNL_ARG_DST, std::move(dst_mem));
-  args.emplace(DNNL_ARG_ATTR_SCALES | DNNL_ARG_WEIGHTS, std::move(scales_mem));
-
-  if (iter->second.hint_usm == nullptr) {
+  if (cached.hint_usm == nullptr) {
     auto sycl_queue = dnnl::sycl_interop::get_queue(stream);
-    iter->second.hint_usm = sycl::malloc_shared<int32_t>(1, sycl_queue);
+    cached.hint_usm = sycl::malloc_shared<int32_t>(1, sycl_queue);
   }
-  iter->second.hint_usm[0] = max_expert_size_val;
-  auto hint_md = dnnl::memory::desc(
-      {1}, dnnl::memory::data_type::s32, dnnl::memory::format_tag::a);
-  auto hint_mem = dnnl::sycl_interop::make_memory(
-      hint_md, engine, dnnl::sycl_interop::memory_kind::usm, iter->second.hint_usm);
-  args.emplace(DNNL_ARG_HINT_MAX_GROUP_SIZE, std::move(hint_mem));
+  cached.hint_usm[0] = max_expert_size_val;
 
-  if (ptr_bias.has_value()) {
-    const at::Tensor& bias = *ptr_bias;
-    auto bias_mem = oneDNN::make_onednn_memory(bias_md, engine, bias.data_ptr());
-    args.emplace(DNNL_ARG_BIAS, std::move(bias_mem));
+  if (!cached.memories_built) {
+    auto hint_md = dnnl::memory::desc(
+        {1}, dnnl::memory::data_type::s32, dnnl::memory::format_tag::a);
+    cached.src_mem = dnnl::sycl_interop::make_memory(
+        cached.src_md, engine, dnnl::sycl_interop::memory_kind::usm,
+        std::vector<void*>{ptr_A.data_ptr(), expert_ends_i32.data_ptr()});
+    cached.dst_mem = dnnl::sycl_interop::make_memory(
+        cached.dst_md, engine, dnnl::sycl_interop::memory_kind::usm,
+        std::vector<void*>{ptr_D.data_ptr(), expert_ends_i32.data_ptr()});
+    cached.wei_mem = oneDNN::make_onednn_memory(
+        cached.wei_md, engine, ptr_B.data_ptr());
+    cached.wei_scales_mem = oneDNN::make_onednn_memory(
+        cached.wei_scales_md, engine, scales.data_ptr());
+    cached.hint_mem = dnnl::sycl_interop::make_memory(
+        hint_md, engine, dnnl::sycl_interop::memory_kind::usm, cached.hint_usm);
+
+    cached.args.emplace(DNNL_ARG_SRC, cached.src_mem);
+    cached.args.emplace(DNNL_ARG_WEIGHTS, cached.wei_mem);
+    cached.args.emplace(DNNL_ARG_DST, cached.dst_mem);
+    cached.args.emplace(DNNL_ARG_ATTR_SCALES | DNNL_ARG_WEIGHTS,
+        cached.wei_scales_mem);
+    cached.args.emplace(DNNL_ARG_HINT_MAX_GROUP_SIZE, cached.hint_mem);
+    if (has_bias) {
+      const at::Tensor& bias = *ptr_bias;
+      cached.bias_mem = oneDNN::make_onednn_memory(
+          cached.bias_md, engine, bias.data_ptr());
+      cached.args.emplace(DNNL_ARG_BIAS, cached.bias_mem);
+    }
+    cached.memories_built = true;
+    cached.exec_handle = dnnl::sycl_interop::execute_handle(
+        cached.prim, stream, cached.args);
+  } else {
+    cached.src_mem.set_data_handle(ptr_A.data_ptr(), 0);
+    cached.src_mem.set_data_handle(expert_ends_i32.data_ptr(), 1);
+    cached.dst_mem.set_data_handle(ptr_D.data_ptr(), 0);
+    cached.dst_mem.set_data_handle(expert_ends_i32.data_ptr(), 1);
+    cached.wei_mem.set_data_handle(ptr_B.data_ptr());
+    cached.wei_scales_mem.set_data_handle(scales.data_ptr());
+    if (has_bias) {
+      cached.bias_mem.set_data_handle(ptr_bias->data_ptr());
+    }
   }
 
-  try {
-    (void)dnnl::sycl_interop::execute(iter->second.prim, stream, args);
-  } catch (const std::exception& e) {
-    TORCH_WARN("oneDNN grouped_gemm_w4a16: execute failed: ", e.what());
-    throw;
+  if (cached.use_fast_path) {
+    try {
+      (void)dnnl::sycl_interop::execute_fast(cached.exec_handle);
+    } catch (const dnnl::error& fast_err) {
+      if (fast_err.status == dnnl_unimplemented) {
+        cached.use_fast_path = false;
+      } else {
+        TORCH_CHECK(false, "oneDNN grouped_gemm_w4a16: execute_fast failed: ",
+                    fast_err.what());
+      }
+    } catch (...) {
+      throw;
+    }
+  }
+  if (!cached.use_fast_path) {
+    try {
+      cached.prim.execute(stream, cached.args);
+    } catch (const dnnl::error& e) {
+      TORCH_CHECK(false, "oneDNN grouped_gemm_w4a16: execute slow failed: ", e.what());
+    } catch (...) {
+      throw;
+    }
   }
 
   return ptr_D;

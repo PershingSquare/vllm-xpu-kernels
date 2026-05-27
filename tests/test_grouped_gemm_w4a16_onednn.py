@@ -129,16 +129,17 @@ def test_grouped_gemm_onednn_w4a16_int4(num_experts: int,
                               dtype=torch.int32).to(torch.uint8)
     packed_u4 = packed_u4.contiguous()
 
-    # Scales: [E, N, K/group_size] fp16 (required by oneDNN path).
-    scales = (torch.rand((num_experts, n, group_num), device=device, dtype=dtype)
-              * 0.5 + 0.01)
-    scales = scales.contiguous()
+    # Keep [E, N, G] for reference math; oneDNN wrapper expects [E, G, N].
+    scales_ref = (torch.rand((num_experts, n, group_num), device=device, dtype=dtype)
+                  * 0.5 + 0.01)
+    scales_ref = scales_ref.contiguous()
+    scales = scales_ref.permute(0, 2, 1).contiguous()
 
     bias = (torch.randn((num_experts, n), device=device, dtype=dtype) * 0.1)
     bias = bias.contiguous()
 
-    # Pass packed u4(zp=8) into the op. The oneDNN wrapper will convert it to
-    # packed s4 (two's complement) internally.
+    # oneDNN consumes packed s4; keep packed_u4 for reference dequantization.
+    packed_s4 = _pack_s4_from_u4_zp8(packed_u4).contiguous()
 
     # Expert offsets: [E+1] int64 (non-uniform token distribution).
     offsets = torch.tensor([0] + list(accumulate(token_counts)),
@@ -153,7 +154,7 @@ def test_grouped_gemm_onednn_w4a16_int4(num_experts: int,
 
     op_kwargs = dict(
         ptr_A=A,
-        ptr_B=packed_u4,
+        ptr_B=packed_s4,
         ptr_scales=scales,
         expert_first_token_offset=offsets,
         N=n,
@@ -208,7 +209,7 @@ def test_grouped_gemm_onednn_w4a16_int4(num_experts: int,
     # -----------------------------
     A_cpu = A.cpu().to(torch.float32)
     packed_u4_cpu = packed_u4.cpu()
-    scales_cpu = scales.cpu()
+    scales_cpu = scales_ref.cpu()
     offsets_cpu = offsets.cpu().tolist()
     bias_cpu = bias.cpu().to(torch.float32)
 

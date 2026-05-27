@@ -157,15 +157,14 @@ def bench_cold(fns_list, warmup, iters, repetitions=3):
 # ---------------------------------------------------------------------------
 
 def run_onednn_w4a8(M, N, K, E, group_size, offsets, max_expert_size, warmup, iters, POOL, use_bias=True):
-    B_s4 = (torch.randint(0, 256, (E, N, K // 2), dtype=torch.uint8, device=DEVICE) ^ 0x88).contiguous()
-    B_scales = torch.rand(E, K // group_size, N, dtype=torch.bfloat16, device=DEVICE) * 0.5 + 0.01
-    # gpt-oss has per-expert bias [E, N] on both gate/up and down projections.
-    bias = (torch.randn(E, N, dtype=torch.bfloat16, device=DEVICE) * 0.01).contiguous() if use_bias else None
-
-    pool_Aq = [torch.empty(M, K, dtype=torch.uint8, device=DEVICE) for _ in range(POOL)]
-    pool_Ascale = [torch.empty(M, dtype=torch.bfloat16, device=DEVICE) for _ in range(POOL)]
-    pool_Azp = [torch.empty(M, dtype=torch.uint8, device=DEVICE) for _ in range(POOL)]
-    pool_D = [torch.empty(M, N, dtype=torch.bfloat16, device=DEVICE) for _ in range(POOL)]
+    # Pool weights: in production weights >> L2 cache, always read from HBM.
+    pool_Aq     = [torch.empty(M, K, dtype=torch.uint8,    device=DEVICE) for _ in range(POOL)]
+    pool_Ascale = [torch.empty(M,    dtype=torch.bfloat16, device=DEVICE) for _ in range(POOL)]
+    pool_Azp    = [torch.empty(M,    dtype=torch.uint8,    device=DEVICE) for _ in range(POOL)]
+    pool_D      = [torch.empty(M, N, dtype=torch.bfloat16, device=DEVICE) for _ in range(POOL)]
+    pool_B    = [(torch.randint(0,256,(E,N,K//2),dtype=torch.uint8,device=DEVICE)^0x88).contiguous() for _ in range(POOL)]
+    pool_Bsc  = [torch.rand(E,K//group_size,N,dtype=torch.bfloat16,device=DEVICE)*0.5+0.01 for _ in range(POOL)]
+    pool_bias = [(torch.randn(E,N,dtype=torch.bfloat16,device=DEVICE)*0.01).contiguous() if use_bias else None for _ in range(POOL)]
 
     def make_fn(slot):
         A_bf16 = torch.randn(M, K, dtype=torch.bfloat16, device=DEVICE) * 0.1
@@ -177,7 +176,7 @@ def run_onednn_w4a8(M, N, K, E, group_size, offsets, max_expert_size, warmup, it
         def fn():
             torch.ops._xpu_C.onednn_grouped_gemm_w4a8(
                 pool_Aq[slot], pool_Ascale[slot], pool_Azp[slot],
-                B_s4, B_scales, bias,
+                pool_B[slot], pool_Bsc[slot], pool_bias[slot],
                 pool_D[slot], offsets, N, K, E, max_expert_size)
         return fn
 
@@ -186,19 +185,19 @@ def run_onednn_w4a8(M, N, K, E, group_size, offsets, max_expert_size, warmup, it
 
 
 def run_onednn_w4a16(M, N, K, E, group_size, offsets, max_expert_size, warmup, iters, POOL, use_bias=True):
-    B_s4 = (torch.randint(0, 256, (E, N, K // 2), dtype=torch.uint8, device=DEVICE) ^ 0x88).contiguous()
-    B_scales = torch.rand(E, K // group_size, N, dtype=torch.bfloat16, device=DEVICE) * 0.5 + 0.01
-    bias = (torch.randn(E, N, dtype=torch.bfloat16, device=DEVICE) * 0.01).contiguous() if use_bias else None
-
-    pool_A = [torch.empty(M, K, dtype=torch.bfloat16, device=DEVICE) for _ in range(POOL)]
-    pool_D = [torch.empty(M, N, dtype=torch.bfloat16, device=DEVICE) for _ in range(POOL)]
+    # Pool weights: force HBM reads, no L2 cache reuse.
+    pool_A    = [torch.empty(M, K, dtype=torch.bfloat16, device=DEVICE) for _ in range(POOL)]
+    pool_D    = [torch.empty(M, N, dtype=torch.bfloat16, device=DEVICE) for _ in range(POOL)]
+    pool_B    = [(torch.randint(0,256,(E,N,K//2),dtype=torch.uint8,device=DEVICE)^0x88).contiguous() for _ in range(POOL)]
+    pool_Bsc  = [torch.rand(E,K//group_size,N,dtype=torch.bfloat16,device=DEVICE)*0.5+0.01 for _ in range(POOL)]
+    pool_bias = [(torch.randn(E,N,dtype=torch.bfloat16,device=DEVICE)*0.01).contiguous() if use_bias else None for _ in range(POOL)]
 
     def make_fn(slot):
         pool_A[slot].copy_(torch.randn(M, K, dtype=torch.bfloat16, device=DEVICE) * 0.1)
 
         def fn():
             torch.ops._xpu_C.onednn_grouped_gemm_w4a16(
-                pool_A[slot], B_s4, B_scales, bias,
+                pool_A[slot], pool_B[slot], pool_Bsc[slot], pool_bias[slot],
                 pool_D[slot], offsets, N, K, E,
                 True, False, max_expert_size)
         return fn
@@ -308,23 +307,21 @@ def run_ipex_mxfp4(M, N, K, E, group_size, offsets, warmup, iters, POOL, use_bia
     ipex_group_size = 32
     ipex_group_num = K // ipex_group_size
     # IPEX weight layout: [E, K//2, N] (transposed vs cutlass [E, N, K//2])
-    B_packed = torch.randint(0, 256, (E, K // 2, N), dtype=torch.uint8, device=DEVICE)
-    B_scales = torch.randint(0, 256, (E, ipex_group_num, N), dtype=torch.uint8, device=DEVICE)
-    # gpt-oss bias [E, N] in bf16
-    bias = (torch.randn(E, N, dtype=torch.bfloat16, device=DEVICE) * 0.01).contiguous() if use_bias else None
     counts = offsets[1:] - offsets[:-1]
     rows_for_experts = counts.to(torch.int32)
-
-    # Pool of buffers: Abf
-    pool_A = [torch.empty(M, K, dtype=torch.bfloat16, device=DEVICE) for _ in range(POOL)]
+    # Pool weights: force HBM reads.
+    pool_A    = [torch.empty(M, K, dtype=torch.bfloat16, device=DEVICE) for _ in range(POOL)]
+    pool_B    = [torch.randint(0,256,(E,K//2,N),dtype=torch.uint8,device=DEVICE) for _ in range(POOL)]
+    pool_Bsc  = [torch.randint(0,256,(E,ipex_group_num,N),dtype=torch.uint8,device=DEVICE) for _ in range(POOL)]
+    pool_bias = [(torch.randn(E,N,dtype=torch.bfloat16,device=DEVICE)*0.01).contiguous() if use_bias else None for _ in range(POOL)]
 
     def make_fn(slot):
         A = torch.randn(M, K, dtype=torch.bfloat16, device=DEVICE) * 0.1
         pool_A[slot].copy_(A)
 
         def fn():
-            xpu.moe_gemm(pool_A[slot], B_packed, rows_for_experts, E,
-                         matrix_b_scale_inv=B_scales, bias=bias, is_mxfp4=True)
+            xpu.moe_gemm(pool_A[slot], pool_B[slot], rows_for_experts, E,
+                         matrix_b_scale_inv=pool_Bsc[slot], bias=pool_bias[slot], is_mxfp4=True)
         return fn
 
     fns_list = [make_fn(i) for i in range(POOL)]
@@ -471,11 +468,16 @@ def run_benchmark(total_M, N, K, E, group_size, top_k, backend, warmup, iters, P
 
 def run_offline(args, configs, backends):
     """Fixed total_M offline benchmark with roofline analysis."""
-    total_M = 3072 * args.top_k  # 12288 by default
+    if args.M is not None:
+        total_M = args.M
+        tokens_label = "decode override"
+    else:
+        total_M = 3072 * args.top_k  # 12288 by default
+        tokens_label = f"tokens=3072, top_k={args.top_k}"
 
     print("=" * 110)
     print("Roofline Benchmark — OFFLINE MODE")
-    print(f"E={E}, Total M={total_M} (tokens=3072, top_k={args.top_k}), bias={'on' if args.bias else 'off'}")
+    print(f"E={E}, Total M={total_M} ({tokens_label}), bias={'on' if args.bias else 'off'}")
     print(f"Peak INT8: {PEAK_INT8_TOPS} TOPS | Peak BF16: {PEAK_BF16_TFLOPS} TFLOPS | Peak BW: {PEAK_BW_GBS} GB/s")
     print(f"Backends: {backends}")
     print("=" * 110)
@@ -661,6 +663,8 @@ def main():
                         help="Token distribution across experts: real (REAL_EXPERT_TOKENS) or uniform (default: real)")
     parser.add_argument("--bias", type=str, choices=["on", "off"], default="on",
                         help="Include per-expert bias [E,N] bf16 to match gpt-oss production (default: on)")
+    parser.add_argument("--M", type=int, default=None,
+                        help="Override total_M for offline mode (e.g. 68 for decode). Default: 3072*top_k.")
     args = parser.parse_args()
     args.bias = (args.bias == "on")
 
