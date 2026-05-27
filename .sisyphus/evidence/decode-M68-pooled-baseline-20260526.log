@@ -1,0 +1,22 @@
+==============================================================================================================
+Roofline Benchmark — OFFLINE MODE
+E=128, Total M=68 (decode override), bias=on
+Peak INT8: 198.0 TOPS | Peak BF16: 99.0 TFLOPS | Peak BW: 456.0 GB/s
+Backends: ['onednn_w4a8', 'onednn_w4a16', 'ipex_mxfp4']
+==============================================================================================================
+Config       | Backend          |      M |       ms | TOPS/TFLOPS |  BW(GB/s) |      AI | Bound    | Roofline%
+--------------------------------------------------------------------------------------------------------------
+TP4 GEMM1    | onednn_w4a8      |     68 |    0.121 |        5.07 |     311.1 |   16.28 | memory   |     68.2%
+TP4 GEMM1    | onednn_w4a16     |     68 |    0.156 |        3.93 |     242.8 |   16.20 | memory   |     53.2%
+TP4 GEMM1    | ipex_mxfp4       |     68 |    0.113 |        5.45 |     331.2 |   16.44 | memory   |     72.6%
+TP4 GEMM2    | onednn_w4a8      |     68 |    0.067 |        4.49 |     280.5 |   16.01 | memory   |     61.5%
+TP4 GEMM2    | onednn_w4a16     |     68 |    0.135 |        2.23 |     139.8 |   15.97 | memory   |     30.7%
+TP4 GEMM2    | ipex_mxfp4       |     68 |    0.067 |        4.47 |     275.6 |   16.21 | memory   |     60.4%
+TP8 GEMM1    | onednn_w4a8      |     68 |    0.071 |        4.35 |     268.8 |   16.20 | memory   |     58.9%
+TP8 GEMM1    | onednn_w4a16     |     68 |    0.125 |        2.46 |     153.3 |   16.03 | memory   |     33.6%
+TP8 GEMM1    | ipex_mxfp4       |     68 |    0.076 |        4.05 |     249.1 |   16.27 | memory   |     54.6%
+TP8 GEMM2    | onednn_w4a8      |     68 |    0.045 |        3.33 |     213.1 |   15.61 | memory   |     46.7%
+TP8 GEMM2    | onednn_w4a16     |     68 |    0.127 |        1.19 |      76.3 |   15.57 | memory   |     16.7%
+TP8 GEMM2    | ipex_mxfp4       |     68 |    0.040 |        3.73 |     235.9 |   15.80 | memory   |     51.7%
+
+Done.
