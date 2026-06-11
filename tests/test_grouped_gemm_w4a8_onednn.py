@@ -104,12 +104,14 @@ def _dequantize_u4_zp8(
 @pytest.mark.parametrize("group_size", [64, 128])
 @pytest.mark.parametrize("out_dtype", [torch.float16, torch.bfloat16])
 @pytest.mark.parametrize("has_bias", [False, True])
+@pytest.mark.parametrize("offset_dtype", [torch.int64, torch.int32])
 def test_grouped_gemm_onednn_w4a8_int8(
     num_experts: int,
     token_counts: list[int],
     group_size: int,
     out_dtype: torch.dtype,
     has_bias: bool,
+    offset_dtype: torch.dtype,
 ):
     _skip_if_xpu_unavailable()
     if not hasattr(torch.ops, "_xpu_C") or not hasattr(torch.ops._xpu_C, "onednn_grouped_gemm_w4a8"):
@@ -190,7 +192,7 @@ def test_grouped_gemm_onednn_w4a8_int8(
         bias_cpu = None
         bias = None
 
-    offsets = offsets_cpu.to(device).contiguous()
+    offsets = offsets_cpu.to(device=device, dtype=offset_dtype).contiguous()
     out = torch.empty((total_m, n), device=device, dtype=out_dtype).contiguous()
     out_repeat = torch.empty((total_m, n), device=device, dtype=out_dtype).contiguous()
 

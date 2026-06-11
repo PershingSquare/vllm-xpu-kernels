@@ -74,11 +74,12 @@ def scale_tokens_to_M(tokens, M):
     return scaled.tolist()
 
 
-def build_topk_ids(token_counts, top_k, num_rows):
+def build_topk_ids(token_counts, top_k, num_rows, num_experts=None):
     rows_total = num_rows * top_k
     flat = []
     for e_id, cnt in enumerate(token_counts):
-        flat.extend([e_id] * cnt)
+        eid = e_id if num_experts is None else e_id % num_experts
+        flat.extend([eid] * cnt)
     if len(flat) > rows_total:
         flat = flat[:rows_total]
     elif len(flat) < rows_total:
@@ -133,11 +134,15 @@ def _dynamic_per_token_quant_int8(x):
 
 # Per-thunk wall-clock timings (host+gpu serial via per-call sync), µs.
 THUNK_TIMES = {}
+THUNK_TIMING_ENABLED = True
 
 
 @contextmanager
 def thunk(name):
     """Time a thunk synchronously: sync-before, time, sync-after."""
+    if not THUNK_TIMING_ENABLED:
+        yield
+        return
     torch.xpu.synchronize()
     t0 = time.perf_counter()
     yield
@@ -178,26 +183,53 @@ def fused_moe_instrumented(
     gemm1_scales = w13_scales if (is_int4 or is_mxfp4) else None
     gemm2_scales = w2_scales if (is_int4 or is_mxfp4) else None
 
-    remapped_hidden_states = torch.empty(
-        (num_moe_inputs, hidden_size),
-        dtype=hidden_states.dtype, device=DEVICE)
     expert_first_token_offset = torch.zeros(
         (num_experts + 1,), dtype=torch.int64, device=DEVICE)
     unpermuted_row_to_permuted_row = torch.empty(
         (num_rows, n_experts_per_token), dtype=torch.int32, device=DEVICE)
 
-    with thunk("remap"):
-        torch.ops._moe_C.remap_hidden_states(
-            hidden_states=hidden_states,
-            hidden_states_scales=None,
-            remapped_hidden_states=remapped_hidden_states,
-            remapped_hidden_states_scales=None,
-            expert_map=None,
-            expert_first_token_offset=expert_first_token_offset,
-            unpermuted_row_to_permuted_row=unpermuted_row_to_permuted_row,
-            topk_ids=topk_ids,
-            total_experts_num=num_experts,
-            local_experts_num=num_experts)
+    _remap_quant_op = getattr(torch.ops._moe_C,
+                              "remap_and_quant_hidden_states_int8", None)
+    use_fused_remap_quant = (using_w4a8 and _remap_quant_op is not None)
+
+    if use_fused_remap_quant:
+        A_q = torch.empty((num_moe_inputs, hidden_size),
+                          dtype=torch.uint8, device=DEVICE)
+        A_scale = torch.empty(num_moe_inputs, dtype=hidden_states.dtype,
+                              device=DEVICE)
+        A_zp = torch.empty(num_moe_inputs, dtype=torch.uint8, device=DEVICE)
+        with thunk("remap_quant_g1"):
+            _remap_quant_op(
+                hidden_states=hidden_states,
+                remapped_q=A_q,
+                remapped_scale=A_scale,
+                remapped_zp=A_zp,
+                expert_map=None,
+                expert_first_token_offset=expert_first_token_offset,
+                unpermuted_row_to_permuted_row=unpermuted_row_to_permuted_row,
+                topk_ids=topk_ids,
+                total_experts_num=num_experts,
+                local_experts_num=num_experts)
+    else:
+        remapped_hidden_states = torch.empty(
+            (num_moe_inputs, hidden_size),
+            dtype=hidden_states.dtype, device=DEVICE)
+        with thunk("remap"):
+            torch.ops._moe_C.remap_hidden_states(
+                hidden_states=hidden_states,
+                hidden_states_scales=None,
+                remapped_hidden_states=remapped_hidden_states,
+                remapped_hidden_states_scales=None,
+                expert_map=None,
+                expert_first_token_offset=expert_first_token_offset,
+                unpermuted_row_to_permuted_row=unpermuted_row_to_permuted_row,
+                topk_ids=topk_ids,
+                total_experts_num=num_experts,
+                local_experts_num=num_experts)
+
+    w4a8_expert_first_token_offset = (
+        expert_first_token_offset.to(torch.int32) if using_w4a8 else None
+    )
 
     max_expert_size = (num_moe_inputs + n_experts_per_token - 1) // n_experts_per_token
 
@@ -211,8 +243,9 @@ def fused_moe_instrumented(
                 matrix_b_scale_inv=w13_scales_ipex, bias=w13_bias,
                 is_mxfp4=True)
     elif using_w4a8:
-        with thunk("pre_quant_g1"):
-            A_q, A_scale, A_zp = _dynamic_per_token_quant_int8(remapped_hidden_states)
+        if not use_fused_remap_quant:
+            with thunk("pre_quant_g1"):
+                A_q, A_scale, A_zp = _dynamic_per_token_quant_int8(remapped_hidden_states)
         gemm1_output = torch.empty(
             (num_moe_inputs, 2 * inter_size),
             dtype=gemm1_output_dtype, device=DEVICE)
@@ -220,7 +253,7 @@ def fused_moe_instrumented(
             torch.ops._xpu_C.onednn_grouped_gemm_w4a8(
                 A_q, A_scale.reshape(-1), A_zp.reshape(-1),
                 w13, gemm1_scales, w13_bias,
-                gemm1_output, expert_first_token_offset,
+                gemm1_output, w4a8_expert_first_token_offset,
                 2 * inter_size, hidden_size, num_experts, max_expert_size)
     else:
         gemm1_output = torch.empty(
@@ -286,7 +319,7 @@ def fused_moe_instrumented(
             torch.ops._xpu_C.onednn_grouped_gemm_w4a8(
                 A_q2, A_scale2.reshape(-1), A_zp2.reshape(-1),
                 w2, gemm2_scales, w2_bias,
-                gemm2_output, expert_first_token_offset,
+                gemm2_output, w4a8_expert_first_token_offset,
                 hidden_size, inter_size * inter_size_scale,
                 num_experts, max_expert_size)
     else:
@@ -338,7 +371,7 @@ def setup_backend(name, num_experts, hidden_size, inter_size, group_size,
                                  device=DEVICE) * 0.1).contiguous()
 
     token_counts = scale_tokens_to_M(REAL_EXPERT_TOKENS, num_rows * top_k)
-    topk_ids = build_topk_ids(token_counts, top_k, num_rows)
+    topk_ids = build_topk_ids(token_counts, top_k, num_rows, num_experts=num_experts)
     topk_weights = torch.softmax(
         torch.randn(num_rows, top_k, dtype=torch.float32, device=DEVICE),
         dim=-1).contiguous()
@@ -431,9 +464,11 @@ def restore_env(saved):
 # ---------------------------------------------------------------------------
 
 def bench_backend(name, kwargs, warmup, iters, fuse_act_quant=False):
-    """Run instrumented xpu_fused_moe and collect per-thunk timings."""
+    """Run instrumented xpu_fused_moe and collect per-thunk plus whole-block timings."""
+    global THUNK_TIMING_ENABLED
     THUNK_TIMES.clear()
 
+    THUNK_TIMING_ENABLED = True
     for _ in range(warmup):
         fused_moe_instrumented(backend_label=name,
                                fuse_act_quant=fuse_act_quant, **kwargs)
@@ -443,11 +478,28 @@ def bench_backend(name, kwargs, warmup, iters, fuse_act_quant=False):
         fused_moe_instrumented(backend_label=name,
                                fuse_act_quant=fuse_act_quant, **kwargs)
 
-    # Median across iters
     medians = {}
     for region, times in THUNK_TIMES.items():
         sorted_t = sorted(times)
         medians[region] = sorted_t[len(sorted_t) // 2]
+
+    whole_times = []
+    THUNK_TIMING_ENABLED = False
+    try:
+        for _ in range(warmup):
+            fused_moe_instrumented(backend_label=name,
+                                   fuse_act_quant=fuse_act_quant, **kwargs)
+        for _ in range(iters):
+            torch.xpu.synchronize()
+            t0 = time.perf_counter()
+            fused_moe_instrumented(backend_label=name,
+                                   fuse_act_quant=fuse_act_quant, **kwargs)
+            torch.xpu.synchronize()
+            whole_times.append((time.perf_counter() - t0) * 1e6)
+    finally:
+        THUNK_TIMING_ENABLED = True
+    sorted_whole = sorted(whole_times)
+    medians["whole_moe_wall"] = sorted_whole[len(sorted_whole) // 2]
     return medians
 
 
@@ -502,9 +554,10 @@ def main():
     print(f"num_tokens={args.num_tokens} (M_total = num_tokens * top_k = {args.num_tokens * args.top_k})")
     print(f"{'=' * 100}\n")
 
-    region_order = ["remap", "pre_quant_g1", "gemm_g1", "act",
-                    "act_quant_fused",
-                    "pre_quant_g2", "gemm_g2", "gather"]
+    region_order = ["remap", "remap_quant_g1", "pre_quant_g1", "gemm_g1",
+                    "act", "act_quant_fused",
+                    "pre_quant_g2", "gemm_g2", "gather",
+                    "whole_moe_wall"]
 
     results = {}
     for name in args.backends:
@@ -526,16 +579,17 @@ def main():
     print("=== Per-thunk wall (µs, median across iters) ===\n")
     header = ["thunk"] + [f"{b}" for b in args.backends]
     rows = []
+    synced_regions = [r for r in region_order if r != "whole_moe_wall"]
     totals = {b: 0.0 for b in args.backends}
     for region in region_order:
         row = [region]
         for b in args.backends:
             t = results[b].get(region, None)
             row.append(f"{t:.1f}" if t is not None else "-")
-            if t is not None:
+            if t is not None and region in synced_regions:
                 totals[b] += t
         rows.append(row)
-    rows.append(["TOTAL"] + [f"{totals[b]:.1f}" for b in args.backends])
+    rows.append(["TOTAL_SYNCED_THUNKS"] + [f"{totals[b]:.1f}" for b in args.backends])
     print_table(rows, header)
 
     print()
@@ -555,16 +609,16 @@ def main():
         after_postop = before - budget_postop
         after_both = before - budget_postop - budget_wrapper
         print(f"[{b}]")
-        print(f"  Current TOTAL                                : {before:7.1f} µs")
+        print(f"  Current synced-thunk total                  : {before:7.1f} µs")
         print(f"  (A) Fusable via PR #5134 (act post-op)       : {budget_postop:7.1f} µs "
               f"({100 * budget_postop / before:.1f}%)")
         if budget_wrapper > 0:
             print(f"  (B) Killable via Tier-1 fused-quant op       : {budget_wrapper:7.1f} µs "
                   f"({100 * budget_wrapper / before:.1f}%)")
-        print(f"  Projected TOTAL after PR #5134 wiring        : {after_postop:7.1f} µs "
+        print(f"  Projected synced total after PR #5134       : {after_postop:7.1f} µs "
               f"(-{before - after_postop:.1f})")
         if budget_wrapper > 0:
-            print(f"  Projected TOTAL after PR #5134 + Tier-1      : {after_both:7.1f} µs "
+            print(f"  Projected synced total after PR#5134+Tier1  : {after_both:7.1f} µs "
                   f"(-{before - after_both:.1f})")
         print()
 
@@ -574,7 +628,7 @@ def main():
         print("=== oneDNN total-MoE-block vs ipex (with optimization projections) ===\n")
         for ik in ipex_keys:
             it = totals[ik]
-            print(f"  Baseline {ik} TOTAL: {it:.1f} µs")
+            print(f"  Baseline {ik} synced TOTAL: {it:.1f} µs")
             for ok in onednn_keys:
                 ot = totals[ok]
                 budget_postop = results[ok].get("act", 0.0)

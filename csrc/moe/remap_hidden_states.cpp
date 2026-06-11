@@ -374,6 +374,304 @@ void RemapHiddenStatesLauncher(
 }  // namespace moe
 }  // namespace vllm
 
+namespace vllm {
+namespace moe {
+
+template <typename TA, int TopK>
+class RemapAndQuantInt8Asym {
+ public:
+  RemapAndQuantInt8Asym(
+      TA const* hidden_states,
+      uint8_t* remapped_q,
+      TA* remapped_scale,
+      uint8_t* remapped_zp,
+      int* expert_map,
+      int* unpermuted_row_to_permuted_row,
+      int64_t* expert_first_token_offset,
+      int64_t* topk_ids,
+      int const num_rows,
+      int const hidden_size,
+      int const total_experts_num)
+      : hidden_states(hidden_states),
+        remapped_q(remapped_q),
+        remapped_scale(remapped_scale),
+        remapped_zp(remapped_zp),
+        expert_map(expert_map),
+        unpermuted_row_to_permuted_row(unpermuted_row_to_permuted_row),
+        expert_first_token_offset(expert_first_token_offset),
+        topk_ids(topk_ids),
+        num_rows(num_rows),
+        hidden_size(hidden_size),
+        total_experts_num(total_experts_num) {}
+
+  static constexpr int WARP_SIZE = 16;
+  static constexpr int GroupWorkItem = 256;
+  static constexpr int VEC = 4;
+  using vec_t = sycl::vec<TA, VEC>;
+  using out_vec_t = sycl::vec<uint8_t, VEC>;
+
+  static inline sycl::nd_range<1> get_nd_range(int num_rows, int hidden_size) {
+    int const n_vec = hidden_size / VEC;
+    int wg = GroupWorkItem;
+    if (wg > n_vec)
+      wg = ((n_vec + WARP_SIZE - 1) / WARP_SIZE) * WARP_SIZE;
+    wg = std::max(wg, WARP_SIZE);
+    return sycl::nd_range<1>(
+        sycl::range<1>(num_rows) * sycl::range<1>(wg), sycl::range<1>(wg));
+  }
+
+  void operator()
+      [[sycl::reqd_sub_group_size(WARP_SIZE)]] (sycl::nd_item<1> item) const {
+    int const tid = static_cast<int>(item.get_local_id(0));
+    int const local_range = static_cast<int>(item.get_local_range(0));
+    int const row = static_cast<int>(item.get_group(0));
+
+    int global_eid[TopK];
+    int local_eid[TopK];
+#pragma unroll
+    for (int i = 0; i < TopK; ++i)
+      global_eid[i] = static_cast<int>(topk_ids[row * TopK + i]);
+
+    if (expert_map != nullptr) {
+#pragma unroll
+      for (int i = 0; i < TopK; ++i)
+        local_eid[i] = expert_map[global_eid[i]];
+    } else {
+#pragma unroll
+      for (int i = 0; i < TopK; ++i)
+        local_eid[i] = global_eid[i];
+    }
+
+    int dst_row[TopK];
+#pragma unroll
+    for (int i = 0; i < TopK; ++i) {
+      dst_row[i] = (local_eid[i] != -1)
+          ? static_cast<int>(
+                unpermuted_row_to_permuted_row[row * TopK + i] +
+                expert_first_token_offset[local_eid[i]])
+          : -1;
+    }
+
+    auto& shared =
+        *sycl::ext::oneapi::group_local_memory_for_overwrite<float[2]>(
+            item.get_group());
+
+    int const n_vec = hidden_size / VEC;
+    vec_t const* in_vec = reinterpret_cast<vec_t const*>(
+        hidden_states + static_cast<int64_t>(row) * hidden_size);
+
+    float thread_min = std::numeric_limits<float>::infinity();
+    float thread_max = -std::numeric_limits<float>::infinity();
+
+#pragma unroll 4
+    for (int i = tid; i < n_vec; i += local_range) {
+      vec_t const v = in_vec[i];
+#pragma unroll
+      for (int j = 0; j < VEC; ++j) {
+        float const x = static_cast<float>(v[j]);
+        thread_min = sycl::min(thread_min, x);
+        thread_max = sycl::max(thread_max, x);
+      }
+    }
+
+    float const block_min = sycl::reduce_over_group(
+        item.get_group(), thread_min, sycl::minimum<float>());
+    float const block_max = sycl::reduce_over_group(
+        item.get_group(), thread_max, sycl::maximum<float>());
+
+    if (tid == 0) {
+      float const range = block_max - block_min;
+      float const scale = sycl::max(range / 255.0f, 1e-10f);
+      float const zp_f = sycl::rint(-block_min / scale);
+      uint8_t const zp_u8 =
+          static_cast<uint8_t>(sycl::clamp(zp_f, 0.0f, 255.0f));
+      shared[0] = scale;
+      shared[1] = static_cast<float>(zp_u8);
+#pragma unroll
+      for (int i = 0; i < TopK; ++i) {
+        if (dst_row[i] != -1) {
+          remapped_scale[dst_row[i]] = static_cast<TA>(scale);
+          remapped_zp[dst_row[i]] = zp_u8;
+        }
+      }
+    }
+    sycl::group_barrier(item.get_group());
+
+    float const scale = shared[0];
+    float const inv_scale = 1.0f / scale;
+    float const zp = shared[1];
+
+    out_vec_t* dst_ptr[TopK];
+#pragma unroll
+    for (int i = 0; i < TopK; ++i) {
+      dst_ptr[i] = (dst_row[i] != -1)
+          ? reinterpret_cast<out_vec_t*>(
+                remapped_q + static_cast<int64_t>(dst_row[i]) * hidden_size)
+          : nullptr;
+    }
+
+#pragma unroll 4
+    for (int i = tid; i < n_vec; i += local_range) {
+      vec_t const v = in_vec[i];
+      out_vec_t o;
+#pragma unroll
+      for (int j = 0; j < VEC; ++j) {
+        float const q =
+            sycl::rint(static_cast<float>(v[j]) * inv_scale + zp);
+        o[j] = static_cast<uint8_t>(sycl::clamp(q, 0.0f, 255.0f));
+      }
+#pragma unroll
+      for (int k = 0; k < TopK; ++k) {
+        if (dst_ptr[k] != nullptr)
+          dst_ptr[k][i] = o;
+      }
+    }
+
+    if (tid == 0) {
+#pragma unroll
+      for (int i = 0; i < TopK; ++i)
+        unpermuted_row_to_permuted_row[row * TopK + i] = dst_row[i];
+    }
+  }
+
+ private:
+  TA const* hidden_states;
+  uint8_t* remapped_q;
+  TA* remapped_scale;
+  uint8_t* remapped_zp;
+  int* expert_map;
+  int* unpermuted_row_to_permuted_row;
+  int64_t* expert_first_token_offset;
+  int64_t* topk_ids;
+  int const num_rows;
+  int const hidden_size;
+  int const total_experts_num;
+};
+
+template <typename TA, int TopK>
+void RemapAndQuantInt8AsymLauncher(
+    TA const* hidden_states,
+    uint8_t* remapped_q,
+    TA* remapped_scale,
+    uint8_t* remapped_zp,
+    int* expert_map,
+    int64_t* expert_first_token_offset,
+    int* unpermuted_row_to_permuted_row,
+    int64_t* topk_ids,
+    int const num_rows,
+    int const hidden_size,
+    int const total_experts_num,
+    int const local_experts_num,
+    sycl::queue& queue) {
+  TORCH_CHECK(
+      local_experts_num <=
+          CalculateFristTokenOffset::MAX_LOCAL_STORAGE *
+              CalculateFristTokenOffset::WARP_SIZE,
+      "local_experts_num exceeds the maximum supported number");
+  TORCH_CHECK(
+      hidden_size % 4 == 0,
+      "hidden_size must be divisible by 4 for remap_and_quant");
+
+  queue.submit([&](sycl::handler& cgh) {
+    cgh.parallel_for(
+        RowsPerExpertCount::get_nd_range(num_rows, TopK),
+        RowsPerExpertCount{expert_map, expert_first_token_offset, topk_ids,
+                           unpermuted_row_to_permuted_row, num_rows, TopK});
+  });
+
+  queue.submit([&](sycl::handler& cgh) {
+    cgh.parallel_for(
+        CalculateFristTokenOffset::get_nd_range(),
+        CalculateFristTokenOffset{expert_first_token_offset, local_experts_num});
+  });
+
+  queue.submit([&](sycl::handler& cgh) {
+    cgh.parallel_for(
+        RemapAndQuantInt8Asym<TA, TopK>::get_nd_range(num_rows, hidden_size),
+        RemapAndQuantInt8Asym<TA, TopK>{
+            hidden_states, remapped_q, remapped_scale, remapped_zp,
+            expert_map, unpermuted_row_to_permuted_row,
+            expert_first_token_offset, topk_ids,
+            num_rows, hidden_size, total_experts_num});
+  });
+}
+
+}  // namespace moe
+}  // namespace vllm
+
+void remap_and_quant_hidden_states_int8(
+    torch::Tensor const& hidden_states,
+    torch::Tensor& remapped_q,
+    torch::Tensor& remapped_scale,
+    torch::Tensor& remapped_zp,
+    c10::optional<torch::Tensor> const& expert_map,
+    torch::Tensor& expert_first_token_offset,
+    torch::Tensor& unpermuted_row_to_permuted_row,
+    torch::Tensor& topk_ids,
+    int64_t total_experts_num,
+    int64_t local_experts_num) {
+  TORCH_CHECK(
+      hidden_states.scalar_type() == torch::kFloat16 ||
+          hidden_states.scalar_type() == torch::kBFloat16,
+      "hidden_states must be fp16 or bf16");
+  TORCH_CHECK(remapped_q.scalar_type() == torch::kByte, "remapped_q must be uint8");
+  TORCH_CHECK(
+      remapped_scale.scalar_type() == hidden_states.scalar_type(),
+      "remapped_scale dtype must match hidden_states");
+  TORCH_CHECK(remapped_zp.scalar_type() == torch::kByte, "remapped_zp must be uint8");
+
+  int const num_rows = hidden_states.size(0);
+  int const hidden_size = hidden_states.size(1);
+  int const TopK = topk_ids.size(1);
+
+  TORCH_CHECK(
+      remapped_q.size(0) == num_rows * TopK &&
+          remapped_q.size(1) == hidden_size,
+      "remapped_q must be [num_rows*TopK, hidden_size]");
+  TORCH_CHECK(
+      remapped_scale.numel() == num_rows * TopK,
+      "remapped_scale must have num_rows*TopK elements");
+  TORCH_CHECK(
+      remapped_zp.numel() == num_rows * TopK,
+      "remapped_zp must have num_rows*TopK elements");
+
+  const at::DeviceGuard device_guard(hidden_states.device());
+  auto& queue = vllm::xpu::vllmGetQueue();
+
+#define LAUNCH_REMAP_QUANT_INT8(TA, TOPK_VAL)                              \
+  vllm::moe::RemapAndQuantInt8AsymLauncher<TA, TOPK_VAL>(                  \
+      reinterpret_cast<TA const*>(hidden_states.data_ptr()),                \
+      remapped_q.data_ptr<uint8_t>(),                                       \
+      reinterpret_cast<TA*>(remapped_scale.data_ptr()),                     \
+      remapped_zp.data_ptr<uint8_t>(),                                      \
+      expert_map.has_value()                                                \
+          ? reinterpret_cast<int*>(expert_map->data_ptr()) : nullptr,       \
+      reinterpret_cast<int64_t*>(expert_first_token_offset.data_ptr()),     \
+      reinterpret_cast<int*>(unpermuted_row_to_permuted_row.data_ptr()),    \
+      reinterpret_cast<int64_t*>(topk_ids.data_ptr()),                      \
+      num_rows, hidden_size, total_experts_num, local_experts_num, queue)
+
+#define DISPATCH_TOPK_REMAP_QUANT(TA)                               \
+  if (TopK == 1)       { LAUNCH_REMAP_QUANT_INT8(TA, 1);  }        \
+  else if (TopK == 2)  { LAUNCH_REMAP_QUANT_INT8(TA, 2);  }        \
+  else if (TopK == 4)  { LAUNCH_REMAP_QUANT_INT8(TA, 4);  }        \
+  else if (TopK == 6)  { LAUNCH_REMAP_QUANT_INT8(TA, 6);  }        \
+  else if (TopK == 8)  { LAUNCH_REMAP_QUANT_INT8(TA, 8);  }        \
+  else if (TopK == 10) { LAUNCH_REMAP_QUANT_INT8(TA, 10); }        \
+  else { throw std::runtime_error("Unsupported TopK value"); }
+
+  if (hidden_states.scalar_type() == torch::kFloat16) {
+    using scalar_t = sycl::half;
+    DISPATCH_TOPK_REMAP_QUANT(scalar_t);
+  } else {
+    using scalar_t = sycl::ext::oneapi::bfloat16;
+    DISPATCH_TOPK_REMAP_QUANT(scalar_t);
+  }
+
+#undef DISPATCH_TOPK_REMAP_QUANT
+#undef LAUNCH_REMAP_QUANT_INT8
+}
+
 void remap_hidden_states(
     torch::Tensor& hidden_states,  // [num_rows, hidden_size]
     const c10::optional<torch::Tensor>&

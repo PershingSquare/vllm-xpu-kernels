@@ -71,6 +71,21 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, xpu_ops) {
       "onednn_grouped_gemm_w4a8", torch::kXPU, &oneDNN::grouped_gemm_w4a8);
 
   xpu_ops.def(
+      "onednn_fused_moe_w4a8(Tensor hidden_states, Tensor w13, "
+      "Tensor w13_scales, Tensor? w13_bias, Tensor w2, Tensor w2_scales, "
+      "Tensor? w2_bias, Tensor topk_weights, Tensor topk_ids, "
+      "Tensor? expert_map, Tensor! output, "
+      "Tensor! A_q1, Tensor! A_scale1, Tensor! A_zp1, Tensor! gemm1_output, "
+      "Tensor! A_q2, Tensor! A_scale2, Tensor! A_zp2, Tensor! gemm2_output, "
+      "Tensor! expert_first_token_offset, Tensor! expert_first_token_offset_i32, "
+      "Tensor! unpermuted_row_to_permuted_row, "
+      "int inter_size, int hidden_size, int num_experts, "
+      "int n_experts_per_token, int total_experts_num, "
+      "float alpha, float limit) -> ()");
+  xpu_ops.impl(
+      "onednn_fused_moe_w4a8", torch::kXPU, &oneDNN::onednn_fused_moe_w4a8);
+
+  xpu_ops.def(
       "deepseek_scaling_rope(Tensor! positions, Tensor! query, Tensor! key, "
       "Tensor? offsets_opt, Tensor! cos_sin_cache, int rotary_dim, bool "
       "is_neox_style) "

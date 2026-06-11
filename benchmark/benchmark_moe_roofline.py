@@ -43,7 +43,10 @@ DEVICE_NAME = "B60"
 HOST_ID = "10.98.74.64"
 CONTAINER_NAME = "hans-gpt-oss-ww17"
 OFFICIAL_BACKEND_ALIASES = {"ipex_w4a16": "ipex_int4"}
-OFFICIAL_BACKENDS = ("onednn_w4a8", "ipex_int4")
+# Maps the --competitor CLI name to its RUNNERS backend (ipex_w4a16 is a legacy alias for ipex_int4).
+COMPETITOR_RUNNER = {"ipex_mxfp4": "ipex_mxfp4", "ipex_int4": "ipex_int4", "ipex_w4a16": "ipex_int4"}
+DEFAULT_COMPETITOR = "ipex_mxfp4"
+OFFICIAL_BACKENDS = ("onednn_w4a8", "ipex_mxfp4")
 OFFICIAL_DISTRIBUTIONS = ("balanced", "sparse-active", "routed/skew")
 DECODE_M_VALUES = list(range(4, 129, 4))
 PREFILL_M_VALUES = [8192, 12288]
@@ -721,6 +724,11 @@ def null_measurement_fields():
         "measured_cv_pct": None,
         "measured_iqr_pct": None,
         "onednn_w4a8_median_us": None,
+        "competitor_backend": None,
+        "competitor_median_us": None,
+        "competitor_p10_us": None,
+        "competitor_p90_us": None,
+        "competitor_iters": None,
         "ipex_w4a16_median_us": None,
         "competitor_margin": None,
         "competitor_pass": False,
@@ -751,17 +759,22 @@ def null_measurement_fields():
 
 
 def failure_row(row_spec, args, dist_info, status, message, backends=None):
+    comp_runner = competitor_runner_backend(args)
+    comp_official = competitor_official_name(args)
     row = common_row_fields(row_spec, args, dist_info)
     row.update(null_measurement_fields())
+    row["competitor_backend"] = comp_official
+    if backends is None:
+        backends = {
+            "onednn_w4a8": {"runner_backend": "onednn_w4a8", "status": status, "error_message": message},
+            comp_official: {"runner_backend": comp_runner, "status": status, "error_message": message},
+        }
     row.update({
         "status": status,
         "error_type": status,
         "error_message": message,
         "failure_reason": message,
-        "backends": backends or {
-            "onednn_w4a8": {"runner_backend": "onednn_w4a8", "status": status, "error_message": message},
-            "ipex_w4a16": {"runner_backend": "ipex_int4", "status": status, "error_message": message},
-        },
+        "backends": backends,
     })
     return row
 
@@ -770,6 +783,15 @@ def backend_official_name(runner_backend):
     if runner_backend == "ipex_int4":
         return "ipex_w4a16"
     return runner_backend
+
+
+def competitor_runner_backend(args):
+    name = getattr(args, "competitor", DEFAULT_COMPETITOR)
+    return COMPETITOR_RUNNER.get(name, name)
+
+
+def competitor_official_name(args):
+    return backend_official_name(competitor_runner_backend(args))
 
 
 def run_backend_measurement(row_spec, args, runner_backend, token_counts):
@@ -807,10 +829,12 @@ def build_paired_row(row_spec, args):
 
     token_counts = dist_info["token_counts"]
     e_active = sum(1 for count in token_counts if count > 0)
+    comp_runner = competitor_runner_backend(args)
+    comp_official = competitor_official_name(args)
     backend_results = {}
     backend_errors = {}
 
-    for runner_backend in OFFICIAL_BACKENDS:
+    for runner_backend in ("onednn_w4a8", comp_runner):
         official_name = backend_official_name(runner_backend)
         try:
             summary, measured_e_active = run_backend_measurement(row_spec, args, runner_backend, token_counts)
@@ -824,11 +848,10 @@ def build_paired_row(row_spec, args):
 
     if backend_errors:
         backends = {}
-        for official_name in ("onednn_w4a8", "ipex_w4a16"):
+        for official_name, runner_backend in (("onednn_w4a8", "onednn_w4a8"), (comp_official, comp_runner)):
             if official_name in backend_results:
                 backends[official_name] = backend_results[official_name]
             else:
-                runner_backend = "ipex_int4" if official_name == "ipex_w4a16" else official_name
                 error_type, error_message = backend_errors.get(official_name, ("crash", "missing backend measurement"))
                 backends[official_name] = {
                     "runner_backend": runner_backend,
@@ -839,7 +862,7 @@ def build_paired_row(row_spec, args):
         return failure_row(row_spec, args, dist_info, first_error[0], first_error[1], backends)
 
     target = backend_results["onednn_w4a8"]
-    competitor = backend_results["ipex_w4a16"]
+    competitor = backend_results[comp_official]
     competitor_margin = competitor["median_us"] / target["median_us"]
     competitor_pass = competitor_margin > 1.0
     roof_fields = roofline_fields(row_spec["M"], shape["N"], shape["K"], e_active, shape["group_size"], target["median_us"], args)
@@ -856,6 +879,15 @@ def build_paired_row(row_spec, args):
         "onednn_w4a8_p10_us": target["p10_us"],
         "onednn_w4a8_p90_us": target["p90_us"],
         "onednn_w4a8_iters": args.iters,
+        "competitor_backend": comp_official,
+        "competitor_median_us": competitor["median_us"],
+        "competitor_p10_us": competitor["p10_us"],
+        "competitor_p90_us": competitor["p90_us"],
+        "competitor_iters": args.iters,
+        f"{comp_official}_median_us": competitor["median_us"],
+        f"{comp_official}_p10_us": competitor["p10_us"],
+        f"{comp_official}_p90_us": competitor["p90_us"],
+        f"{comp_official}_iters": args.iters,
         "ipex_w4a16_median_us": competitor["median_us"],
         "ipex_w4a16_p10_us": competitor["p10_us"],
         "ipex_w4a16_p90_us": competitor["p90_us"],
@@ -1130,6 +1162,9 @@ def main():
                         default=["onednn_w4a8", "ipex_mxfp4"],
                         choices=ALL_BACKENDS + ["ipex_w4a16", "all"],
                         help="Backend(s) to benchmark (default: onednn_w4a8 ipex_mxfp4; pass 'all' for full sweep)")
+    parser.add_argument("--competitor", type=str, choices=["ipex_mxfp4", "ipex_int4", "ipex_w4a16"],
+                        default=DEFAULT_COMPETITOR,
+                        help="Competitor backend for the paired --matrix JSON (default: ipex_mxfp4)")
     parser.add_argument("--warmup", type=int, default=20)
     parser.add_argument("--iters", type=int, default=100,
                         help="Kernel calls per batch-async timing rep. Default: 100.")

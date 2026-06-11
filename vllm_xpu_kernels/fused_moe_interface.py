@@ -12,6 +12,53 @@ except ImportError as e:
     FUSEDMOE_AVAILABLE = False
 
 
+class _W4A8ScratchPool:
+    """Per-shape reusable device buffers for the W4A8 fused-MoE path.
+
+    vLLM runs MoE layers sequentially in eager mode (--enforce-eager), so a
+    single buffer set is reused across all layers and decode steps. Buffers are
+    keyed by shape/dtype/device; a key change reallocates the whole set. This
+    removes the per-layer torch.empty/zeros and the int64->int32 offset cast
+    (~25us host work per layer) from the hot path.
+    """
+
+    __slots__ = ("_key", "_buffers")
+
+    def __init__(self):
+        self._key = None
+        self._buffers = None
+
+    def get(self, num_rows, top_k, hidden, inter, num_experts, dtype, device):
+        num_moe = top_k * num_rows
+        key = (num_rows, top_k, hidden, inter, num_experts, dtype, str(device))
+        if key != self._key:
+            self._buffers = {
+                "gemm1_output": torch.empty((num_moe, 2 * inter),
+                                            dtype=dtype, device=device),
+                "gemm2_output": torch.empty((num_moe, hidden),
+                                            dtype=dtype, device=device),
+                "a_q1": torch.empty((num_moe, hidden),
+                                    dtype=torch.uint8, device=device),
+                "a_scale1": torch.empty(num_moe, dtype=dtype, device=device),
+                "a_zp1": torch.empty(num_moe, dtype=torch.uint8, device=device),
+                "a_q2": torch.empty((num_moe, inter),
+                                    dtype=torch.uint8, device=device),
+                "a_scale2": torch.empty(num_moe, dtype=dtype, device=device),
+                "a_zp2": torch.empty(num_moe, dtype=torch.uint8, device=device),
+                "offset_i64": torch.empty((num_experts + 1,),
+                                          dtype=torch.int64, device=device),
+                "offset_i32": torch.empty((num_experts + 1,),
+                                          dtype=torch.int32, device=device),
+                "row_map": torch.empty((num_rows, top_k),
+                                       dtype=torch.int32, device=device),
+            }
+            self._key = key
+        return self._buffers
+
+
+_w4a8_scratch = _W4A8ScratchPool()
+
+
 def _use_w4a8() -> bool:
     return os.environ.get("VLLM_XPU_USE_W4A8", "0") == "1"
 
@@ -230,9 +277,18 @@ def xpu_fused_moe(hidden_states,
     num_moe_inputs = n_experts_per_token * num_rows
     if topk_ids.dtype == torch.int32:
         topk_ids = topk_ids.to(torch.int64)
-    gemm1_output = torch.empty((num_moe_inputs, 2 * inter_size),
-                               dtype=hidden_states.dtype,
-                               device=hidden_states.device)
+
+    _pool = (_w4a8_scratch.get(num_rows, n_experts_per_token, hidden_size,
+                               inter_size, num_experts, hidden_states.dtype,
+                               hidden_states.device)
+             if using_w4a8 else None)
+
+    if _pool is not None:
+        gemm1_output = _pool["gemm1_output"]
+    else:
+        gemm1_output = torch.empty((num_moe_inputs, 2 * inter_size),
+                                   dtype=hidden_states.dtype,
+                                   device=hidden_states.device)
 
     if not is_fp8 and not is_int4 and not is_mxfp4:
         gemm1_scales = None
@@ -254,41 +310,112 @@ def xpu_fused_moe(hidden_states,
         total_experts_num = num_experts * ep_size
     local_experts_num = num_experts
 
-    remapped_hidden_states = torch.empty(
-        (num_rows * n_experts_per_token, hidden_size),
-        dtype=hidden_states.dtype,
-        device=hidden_states.device)
-    expert_first_token_offset = torch.zeros((num_experts + 1),
-                                            dtype=torch.int64,
-                                            device=hidden_states.device)
-    unpermuted_row_to_permuted_row = torch.empty(
-        (num_rows, n_experts_per_token),
-        dtype=torch.int32,
-        device=hidden_states.device)
+    if _pool is not None:
+        expert_first_token_offset = _pool["offset_i64"]
+        expert_first_token_offset.zero_()
+        unpermuted_row_to_permuted_row = _pool["row_map"]
+    else:
+        expert_first_token_offset = torch.zeros((num_experts + 1),
+                                                dtype=torch.int64,
+                                                device=hidden_states.device)
+        unpermuted_row_to_permuted_row = torch.empty(
+            (num_rows, n_experts_per_token),
+            dtype=torch.int32,
+            device=hidden_states.device)
 
-    torch.ops._moe_C.remap_hidden_states(
-        hidden_states=hidden_states,
-        hidden_states_scales=None,
-        remapped_hidden_states=remapped_hidden_states,
-        remapped_hidden_states_scales=None,
-        expert_map=expert_map,
-        expert_first_token_offset=expert_first_token_offset,
-        unpermuted_row_to_permuted_row=unpermuted_row_to_permuted_row,
-        topk_ids=topk_ids,
-        total_experts_num=total_experts_num,
-        local_experts_num=local_experts_num)
+    _remap_quant_op = getattr(torch.ops._moe_C,
+                              "remap_and_quant_hidden_states_int8", None)
+    _use_fused_remap_quant = (using_w4a8 and _remap_quant_op is not None)
+
+    _is_swigluoai = (activation == "swigluoai" or
+                     ("SWIGLUOAI" in str(activation)))
+    _inter_scale = 2 if activation == "relu2_no_mul" else 1
+    _act_quant_op = getattr(torch.ops._C,
+                            "swigluoai_and_mul_quant_int8_asym", None)
+    _blob_op = getattr(torch.ops._xpu_C, "onednn_fused_moe_w4a8", None)
+    _blob_enabled = os.environ.get("VLLM_XPU_W4A8_FUSED_BLOB", "1") == "1"
+    _use_blob = (_blob_enabled and using_w4a8 and _pool is not None
+                 and _use_fused_remap_quant
+                 and _is_swigluoai and _inter_scale == 1
+                 and _act_quant_op is not None and _blob_op is not None)
+
+    if _use_blob:
+        _blob_op(
+            hidden_states, w13, gemm1_scales, w13_bias,
+            w2, gemm2_scales, w2_bias,
+            topk_weights, topk_ids, expert_map, output,
+            _pool["a_q1"], _pool["a_scale1"], _pool["a_zp1"],
+            gemm1_output,
+            _pool["a_q2"], _pool["a_scale2"], _pool["a_zp2"],
+            _pool["gemm2_output"],
+            expert_first_token_offset, _pool["offset_i32"],
+            unpermuted_row_to_permuted_row,
+            inter_size, hidden_size, num_experts, n_experts_per_token,
+            total_experts_num, 1.702, 7.0)
+        return output
+
+    if _use_fused_remap_quant:
+        if _pool is not None:
+            A_q = _pool["a_q1"]
+            A_scale = _pool["a_scale1"]
+            A_zp = _pool["a_zp1"]
+        else:
+            A_q = torch.empty((num_moe_inputs, hidden_size),
+                              dtype=torch.uint8, device=hidden_states.device)
+            A_scale = torch.empty(num_moe_inputs, dtype=hidden_states.dtype,
+                                  device=hidden_states.device)
+            A_zp = torch.empty(num_moe_inputs, dtype=torch.uint8,
+                               device=hidden_states.device)
+        _remap_quant_op(
+            hidden_states=hidden_states,
+            remapped_q=A_q,
+            remapped_scale=A_scale,
+            remapped_zp=A_zp,
+            expert_map=expert_map,
+            expert_first_token_offset=expert_first_token_offset,
+            unpermuted_row_to_permuted_row=unpermuted_row_to_permuted_row,
+            topk_ids=topk_ids,
+            total_experts_num=total_experts_num,
+            local_experts_num=local_experts_num)
+    else:
+        remapped_hidden_states = torch.empty(
+            (num_rows * n_experts_per_token, hidden_size),
+            dtype=hidden_states.dtype,
+            device=hidden_states.device)
+        torch.ops._moe_C.remap_hidden_states(
+            hidden_states=hidden_states,
+            hidden_states_scales=None,
+            remapped_hidden_states=remapped_hidden_states,
+            remapped_hidden_states_scales=None,
+            expert_map=expert_map,
+            expert_first_token_offset=expert_first_token_offset,
+            unpermuted_row_to_permuted_row=unpermuted_row_to_permuted_row,
+            topk_ids=topk_ids,
+            total_experts_num=total_experts_num,
+            local_experts_num=local_experts_num)
+
+    if using_w4a8:
+        if _pool is not None:
+            w4a8_expert_first_token_offset = _pool["offset_i32"]
+            w4a8_expert_first_token_offset.copy_(expert_first_token_offset)
+        else:
+            w4a8_expert_first_token_offset = expert_first_token_offset.to(
+                torch.int32)
+    else:
+        w4a8_expert_first_token_offset = None
 
     input_B = w13
 
     max_expert_size = (num_moe_inputs + n_experts_per_token - 1) // n_experts_per_token
 
     if using_w4a8:
-        A_q, A_scale, A_zp = _dynamic_per_token_quant_int8(
-            remapped_hidden_states)
+        if not _use_fused_remap_quant:
+            A_q, A_scale, A_zp = _dynamic_per_token_quant_int8(
+                remapped_hidden_states)
         torch.ops._xpu_C.onednn_grouped_gemm_w4a8(
             A_q, A_scale.reshape(-1), A_zp.reshape(-1),
             input_B, gemm1_scales, w13_bias,
-            gemm1_output, expert_first_token_offset,
+            gemm1_output, w4a8_expert_first_token_offset,
             2 * inter_size, hidden_size, num_experts, max_expert_size)
     else:
         torch.ops._xpu_C.grouped_gemm_interface(
@@ -315,22 +442,30 @@ def xpu_fused_moe(hidden_states,
                           and fused_act_quant_op is not None)
 
     input_B = w2
-    gemm2_output = torch.empty((num_moe_inputs, hidden_size),
-                                dtype=hidden_states.dtype,
-                                device=hidden_states.device)
+    if _pool is not None:
+        gemm2_output = _pool["gemm2_output"]
+    else:
+        gemm2_output = torch.empty((num_moe_inputs, hidden_size),
+                                    dtype=hidden_states.dtype,
+                                    device=hidden_states.device)
 
     if can_fuse_act_quant:
-        A_q2 = torch.empty((num_moe_inputs, inter_size),
-                           dtype=torch.uint8, device=gemm1_output.device)
-        A_scale2 = torch.empty(num_moe_inputs, dtype=gemm1_output.dtype,
-                               device=gemm1_output.device)
-        A_zp2 = torch.empty(num_moe_inputs, dtype=torch.uint8,
-                            device=gemm1_output.device)
+        if _pool is not None:
+            A_q2 = _pool["a_q2"]
+            A_scale2 = _pool["a_scale2"]
+            A_zp2 = _pool["a_zp2"]
+        else:
+            A_q2 = torch.empty((num_moe_inputs, inter_size),
+                               dtype=torch.uint8, device=gemm1_output.device)
+            A_scale2 = torch.empty(num_moe_inputs, dtype=gemm1_output.dtype,
+                                   device=gemm1_output.device)
+            A_zp2 = torch.empty(num_moe_inputs, dtype=torch.uint8,
+                                device=gemm1_output.device)
         fused_act_quant_op(A_q2, A_scale2, A_zp2, gemm1_output, 1.702, 7.0)
         torch.ops._xpu_C.onednn_grouped_gemm_w4a8(
             A_q2, A_scale2, A_zp2,
             input_B, gemm2_scales, w2_bias,
-            gemm2_output, expert_first_token_offset,
+            gemm2_output, w4a8_expert_first_token_offset,
             hidden_size, inter_size, num_experts, max_expert_size)
     else:
         act_output = torch.empty(
@@ -354,7 +489,7 @@ def xpu_fused_moe(hidden_states,
             torch.ops._xpu_C.onednn_grouped_gemm_w4a8(
                 A_q2, A_scale2.reshape(-1), A_zp2.reshape(-1),
                 input_B, gemm2_scales, w2_bias,
-                gemm2_output, expert_first_token_offset,
+                gemm2_output, w4a8_expert_first_token_offset,
                 hidden_size, inter_size * inter_size_scale, num_experts, max_expert_size)
         else:
             torch.ops._xpu_C.grouped_gemm_interface(
