@@ -33,6 +33,7 @@ struct grouped_gemm_primitive_key_t {
 
   int64_t has_bias = 0;
   int64_t max_expert_size = 0;
+  int64_t token_centric_prefill_tune = 0;
 
   bool operator==(const grouped_gemm_primitive_key_t& other) const {
     return device_id == other.device_id && src_dtype == other.src_dtype &&
@@ -44,7 +45,8 @@ struct grouped_gemm_primitive_key_t {
         total_m == other.total_m && n == other.n && k == other.k &&
         num_experts == other.num_experts && group_num == other.group_num &&
         group_size == other.group_size && has_bias == other.has_bias &&
-        max_expert_size == other.max_expert_size;
+        max_expert_size == other.max_expert_size &&
+        token_centric_prefill_tune == other.token_centric_prefill_tune;
   }
 };
 
@@ -79,6 +81,7 @@ struct hash<oneDNN::grouped_gemm_primitive_key_t> {
 
     hash_combine(key.has_bias);
     hash_combine(key.max_expert_size);
+    hash_combine(key.token_centric_prefill_tune);
     return seed;
   }
 };

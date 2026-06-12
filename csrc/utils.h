@@ -75,13 +75,15 @@ static inline std::optional<std::string> getEnv(const char* name) {
   return std::nullopt;
 }
 
+static inline bool env_flag_enabled(const char* name) {
+  auto env_val = getEnv(name);
+  if (!env_val.has_value()) return false;
+  const auto& value = env_val.value();
+  return value == "1" || value == "true" || value == "TRUE";
+}
+
 static inline bool force_xe_default_kernel() {
-  auto env_val = getEnv("VLLM_XPU_FORCE_XE_DEFAULT_KERNEL");
-  if (env_val.has_value()) {
-    return env_val.value() == "1" || env_val.value() == "true" ||
-           env_val.value() == "TRUE";
-  }
-  return false;
+  return env_flag_enabled("VLLM_XPU_FORCE_XE_DEFAULT_KERNEL");
 }
 
 template <typename T>

@@ -181,6 +181,11 @@ torch::Tensor grouped_gemm_w4a16(
   cache_key.group_size = group_size;
   cache_key.has_bias = has_bias ? 1 : 0;
   cache_key.max_expert_size = max_expert_size;
+  cache_key.token_centric_prefill_tune =
+      vllm::xpu::env_flag_enabled(
+          "VLLM_XPU_ONEDNN_TOKEN_CENTRIC_PREFILL_TUNE")
+      ? 1
+      : 0;
 
   auto& primitive_cache = get_grouped_gemm_primitive_cache(device_id);
   auto iter = primitive_cache.find(cache_key);
