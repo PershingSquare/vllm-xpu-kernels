@@ -390,7 +390,8 @@ torch::Tensor grouped_gemm_w4a8(
   cache_key.group_size = group_size;
   cache_key.has_bias = has_bias ? 1 : 0;
   cache_key.max_expert_size = max_expert_size;
-  cache_key.w4a8_large_m_tile = w4a8_large_m_tile_enabled() ? 1 : 0;
+  cache_key.w4a8_large_m_tile =
+      (w4a8_large_m_tile_enabled() && total_M >= 1024) ? 1 : 0;
   cache_key.token_centric_prefill_tune =
       token_centric_prefill_tune_enabled() ? 1 : 0;
 
