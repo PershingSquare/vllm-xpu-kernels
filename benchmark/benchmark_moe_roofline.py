@@ -5,7 +5,10 @@
 Usage:
     ZE_AFFINITY_MASK=2 python benchmark/benchmark_moe_roofline.py --mode offline
     ZE_AFFINITY_MASK=2 python benchmark/benchmark_moe_roofline.py --mode server --dist-file gpt-oss-120b-token-counts.md
-    ZE_AFFINITY_MASK=2 python benchmark/benchmark_moe_roofline.py --mode offline --tp 4 --backend onednn_w4a8
+    ZE_AFFINITY_MASK=2 python benchmark/benchmark_moe_roofline.py --mode offline --tp 1 --backend onednn_w4a8 ipex_mxfp4
+
+The ipex_mxfp4 lane is the single-GPU IPEX MXFP4 baseline used by
+vLLM's XpuIpexMxfp4MoEMethod/GatedMLPMOE path.
 """
 
 import torch
@@ -27,6 +30,10 @@ import vllm_xpu_kernels._xpu_C  # noqa: F401
 
 DEVICE = "xpu"
 ALL_BACKENDS = ["onednn_w4a8", "onednn_w4a16", "cutlass_w4a16", "cutlass_mxfp4", "ipex_int4", "ipex_mxfp4"]
+
+# TP1 shapes (single-GPU gpt-oss-120b)
+TP1_GEMM1 = {"K": 2944, "N": 6144, "group_size": 128}
+TP1_GEMM2 = {"K": 3072, "N": 2880, "group_size": 128}
 
 # TP4 shapes
 TP4_GEMM1 = {"K": 2944, "N": 1536, "group_size": 128}
@@ -328,33 +335,38 @@ def run_ipex_int4(M, N, K, E, group_size, offsets, warmup, iters, POOL, use_bias
 
 
 def run_ipex_mxfp4(M, N, K, E, group_size, offsets, warmup, iters, POOL, use_bias=True, repetitions=3, return_samples=False):
-    """IPEX moe_gemm mxfp4: bf16 activations, mxfp4 weights, uint8 MX scales (group_size=32 only)."""
+    """IPEX MXFP4 kernel used by vLLM's XpuIpexMxfp4MoEMethod/GatedMLPMOE path."""
     import torch.xpu as xpu
     import intel_extension_for_pytorch  # noqa
 
-    # IPEX mxfp4 requires group_size=32
-    ipex_group_size = 32
-    ipex_group_num = K // ipex_group_size
-    # IPEX weight layout: [E, K//2, N] (transposed vs cutlass [E, N, K//2])
-    counts = offsets[1:] - offsets[:-1]
-    rows_for_experts = counts.to(torch.int32)
-    # Pool weights: force HBM reads.
-    pool_A    = [torch.empty(M, K, dtype=torch.bfloat16, device=DEVICE) for _ in range(POOL)]
-    pool_B    = [torch.randint(0,256,(E,K//2,N),dtype=torch.uint8,device=DEVICE) for _ in range(POOL)]
-    pool_Bsc  = [torch.randint(0,256,(E,ipex_group_num,N),dtype=torch.uint8,device=DEVICE) for _ in range(POOL)]
-    pool_bias = [(torch.randn(E,N,dtype=torch.bfloat16,device=DEVICE)*0.01).contiguous() if use_bias else None for _ in range(POOL)]
+    old_backend = os.environ.get("VLLM_XPU_GROUPED_GEMM_BACKEND", "")
+    os.environ["VLLM_XPU_GROUPED_GEMM_BACKEND"] = "ipex"
+    try:
+        # IPEX mxfp4 requires group_size=32
+        ipex_group_size = 32
+        ipex_group_num = K // ipex_group_size
+        # IPEX weight layout: [E, K//2, N] (transposed vs cutlass [E, N, K//2])
+        counts = offsets[1:] - offsets[:-1]
+        rows_for_experts = counts.to(torch.int32)
+        # Pool weights: force HBM reads.
+        pool_A    = [torch.empty(M, K, dtype=torch.bfloat16, device=DEVICE) for _ in range(POOL)]
+        pool_B    = [torch.randint(0,256,(E,K//2,N),dtype=torch.uint8,device=DEVICE) for _ in range(POOL)]
+        pool_Bsc  = [torch.randint(0,256,(E,ipex_group_num,N),dtype=torch.uint8,device=DEVICE) for _ in range(POOL)]
+        pool_bias = [(torch.randn(E,N,dtype=torch.bfloat16,device=DEVICE)*0.01).contiguous() if use_bias else None for _ in range(POOL)]
 
-    def make_fn(slot):
-        A = torch.randn(M, K, dtype=torch.bfloat16, device=DEVICE) * 0.1
-        pool_A[slot].copy_(A)
+        def make_fn(slot):
+            A = torch.randn(M, K, dtype=torch.bfloat16, device=DEVICE) * 0.1
+            pool_A[slot].copy_(A)
 
-        def fn():
-            xpu.moe_gemm(pool_A[slot], pool_B[slot], rows_for_experts, E,
-                         matrix_b_scale_inv=pool_Bsc[slot], bias=pool_bias[slot], is_mxfp4=True)
-        return fn
+            def fn():
+                xpu.moe_gemm(pool_A[slot], pool_B[slot], rows_for_experts, E,
+                             matrix_b_scale_inv=pool_Bsc[slot], bias=pool_bias[slot], is_mxfp4=True)
+            return fn
 
-    fns_list = [make_fn(i) for i in range(POOL)]
-    return bench_cold(fns_list, warmup, iters, repetitions, return_samples)
+        fns_list = [make_fn(i) for i in range(POOL)]
+        return bench_cold(fns_list, warmup, iters, repetitions, return_samples)
+    finally:
+        os.environ["VLLM_XPU_GROUPED_GEMM_BACKEND"] = old_backend
 
 
 RUNNERS = {
@@ -508,6 +520,10 @@ def normalize_backend_list(backends):
 
 
 def shape_for(tp, gemm):
+    if tp == 1 and gemm == "GEMM1":
+        return TP1_GEMM1
+    if tp == 1 and gemm == "GEMM2":
+        return TP1_GEMM2
     if tp == 4 and gemm == "GEMM1":
         return TP4_GEMM1
     if tp == 4 and gemm == "GEMM2":
@@ -907,7 +923,7 @@ def build_paired_row(row_spec, args):
 def full_matrix_specs():
     specs = []
     for total_M in [*DECODE_M_VALUES, *PREFILL_M_VALUES]:
-        for tp in (4, 8):
+        for tp in (1,):
             for gemm in ("GEMM1", "GEMM2"):
                 for distribution in OFFICIAL_DISTRIBUTIONS:
                     specs.append({"tp": tp, "gemm": gemm, "M": total_M, "distribution": distribution, "shape": shape_for(tp, gemm)})
@@ -916,9 +932,9 @@ def full_matrix_specs():
 
 def subset_matrix_specs():
     return [
-        {"tp": 4, "gemm": "GEMM1", "M": 4, "distribution": "balanced", "shape": shape_for(4, "GEMM1")},
-        {"tp": 4, "gemm": "GEMM1", "M": 8, "distribution": "balanced", "shape": shape_for(4, "GEMM1")},
-        {"tp": 8, "gemm": "GEMM2", "M": 128, "distribution": "sparse-active", "shape": shape_for(8, "GEMM2")},
+        {"tp": 1, "gemm": "GEMM1", "M": 4, "distribution": "balanced", "shape": shape_for(1, "GEMM1")},
+        {"tp": 1, "gemm": "GEMM1", "M": 8, "distribution": "balanced", "shape": shape_for(1, "GEMM1")},
+        {"tp": 1, "gemm": "GEMM2", "M": 128, "distribution": "sparse-active", "shape": shape_for(1, "GEMM2")},
     ]
 
 
@@ -1156,8 +1172,8 @@ def main():
         description="Benchmark grouped GEMM with roofline analysis (offline/server modes)")
     parser.add_argument("--mode", type=str, choices=["offline", "server"], required=True,
                         help="Benchmark mode: offline (fixed M) or server (distribution-based)")
-    parser.add_argument("--tp", type=str, choices=["4", "8", "both"], default="both",
-                        help="Tensor parallelism: 4, 8, or both (default: both)")
+    parser.add_argument("--tp", type=str, choices=["1", "4", "8", "both"], default="1",
+                        help="Tensor parallelism shape set: 1, 4, 8, or both TP4/TP8 (default: 1)")
     parser.add_argument("--backend", type=str, nargs="+",
                         default=["onednn_w4a8", "ipex_mxfp4"],
                         choices=ALL_BACKENDS + ["ipex_w4a16", "all"],
@@ -1216,6 +1232,9 @@ def main():
     backends = normalize_backend_list(ALL_BACKENDS if "all" in args.backend else args.backend)
 
     configs = []
+    if args.tp == "1":
+        configs.append(("TP1 GEMM1", TP1_GEMM1))
+        configs.append(("TP1 GEMM2", TP1_GEMM2))
     if args.tp in ("4", "both"):
         configs.append(("TP4 GEMM1", TP4_GEMM1))
         configs.append(("TP4 GEMM2", TP4_GEMM2))

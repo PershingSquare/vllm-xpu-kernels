@@ -7,9 +7,10 @@ vector eats:
   (A) PR #5134 post-ops (oneDNN-only) -> 'act' thunk into G1 epilogue
   (B) Tier-1 fused-quant SYCL kernel  -> 'pre_quant_g1' / 'pre_quant_g2'
 
-ipex's xpu.moe_gemm path cannot benefit from (A) because the GEMM API does not
-expose post-ops. It shares the same activation kernel overhead at decode but
-has no way to absorb it.
+ipex_mxfp4 is timed through the monolithic IPEX GatedMLPMOE module used by
+XpuIpexMxfp4MoEMethod. IPEX does not expose the module's internal stages here,
+so it reports only whole_moe_wall. oneDNN lanes keep the expanded equivalent
+MoE block timing with per-stage thunks plus whole_moe_wall.
 
 Usage:
   ZE_AFFINITY_MASK=2 python benchmark/benchmark_fused_moe_thunks.py --mode decode
@@ -17,12 +18,12 @@ Usage:
   ZE_AFFINITY_MASK=2 python benchmark/benchmark_fused_moe_thunks.py --mode decode --backends ipex_mxfp4 onednn_w4a16
 
 Backends:
-  - ipex_mxfp4:    direct xpu.moe_gemm (mxfp4 weights, group_size=32)
+  - ipex_mxfp4:    IPEX MXFP4 monolithic XpuIpexMxfp4MoEMethod/GatedMLPMOE path
   - onednn_w4a16:  VLLM_XPU_GROUPED_GEMM_BACKEND=onednn, w4a16 path through xpu_fused_moe
   - onednn_w4a8:   VLLM_XPU_GROUPED_GEMM_BACKEND=onednn + VLLM_XPU_USE_W4A8=1, w4a8 path
 
-All lanes execute the same 7-thunk MoE block (remap + G1 + activation + G2 + gather)
-to make the per-thunk comparison apples-to-apples.
+oneDNN lanes execute the equivalent 7-thunk MoE block (remap + G1 + activation +
+G2 + gather). IPEX reports the single monolithic GatedMLPMOE wall time.
 
 Per-thunk regions reported (in execution order):
   - remap         _moe_C.remap_hidden_states  (permute tokens to expert layout)
@@ -36,6 +37,7 @@ Per-thunk regions reported (in execution order):
 
 import argparse
 import os
+import statistics
 import time
 from contextlib import contextmanager
 
@@ -47,8 +49,8 @@ np.random.seed(0)
 
 DEVICE = "xpu"
 
-TP4_GEMM1 = {"K": 2944, "N": 1536, "group_size": 128}
-TP4_GEMM2 = {"K": 768, "N": 2880, "group_size": 128}
+TP1_GEMM1 = {"K": 2944, "N": 6144, "group_size": 128}
+TP1_GEMM2 = {"K": 3072, "N": 2880, "group_size": 128}
 E_DEFAULT = 128
 TOPK_DEFAULT = 4
 
@@ -87,6 +89,30 @@ def build_topk_ids(token_counts, top_k, num_rows, num_experts=None):
     np.random.shuffle(flat)
     return torch.tensor(flat, dtype=torch.int64, device=DEVICE).reshape(
         num_rows, top_k)
+
+
+def build_router_logits(token_counts, top_k, num_rows, num_experts):
+    topk_ids = build_topk_ids(token_counts, top_k, num_rows,
+                              num_experts=num_experts).cpu().numpy()
+    for row in range(num_rows):
+        seen = set()
+        for col in range(top_k):
+            eid = int(topk_ids[row, col])
+            if eid not in seen:
+                seen.add(eid)
+                continue
+            for replacement in range(num_experts):
+                if replacement not in seen:
+                    topk_ids[row, col] = replacement
+                    seen.add(replacement)
+                    break
+
+    router_logits = torch.full((num_rows, num_experts), -20.0,
+                               dtype=torch.float32, device=DEVICE)
+    scores = torch.linspace(4.0, 1.0, top_k, dtype=torch.float32, device=DEVICE)
+    ids = torch.tensor(topk_ids, dtype=torch.int64, device=DEVICE)
+    router_logits.scatter_(1, ids, scores.expand(num_rows, top_k))
+    return router_logits
 
 
 # ---------------------------------------------------------------------------
@@ -359,7 +385,7 @@ def setup_backend(name, num_experts, hidden_size, inter_size, group_size,
     is_mxfp4 = "mxfp4" in name
 
     if name == "ipex_mxfp4":
-        env = {"VLLM_XPU_GROUPED_GEMM_BACKEND": "", "VLLM_XPU_USE_W4A8": "0"}
+        env = {"VLLM_XPU_GROUPED_GEMM_BACKEND": "ipex", "VLLM_XPU_USE_W4A8": "0"}
     elif name == "onednn_w4a16":
         env = {"VLLM_XPU_GROUPED_GEMM_BACKEND": "onednn", "VLLM_XPU_USE_W4A8": "0"}
     elif name == "onednn_w4a8":
@@ -371,10 +397,11 @@ def setup_backend(name, num_experts, hidden_size, inter_size, group_size,
                                  device=DEVICE) * 0.1).contiguous()
 
     token_counts = scale_tokens_to_M(REAL_EXPERT_TOKENS, num_rows * top_k)
-    topk_ids = build_topk_ids(token_counts, top_k, num_rows, num_experts=num_experts)
-    topk_weights = torch.softmax(
-        torch.randn(num_rows, top_k, dtype=torch.float32, device=DEVICE),
-        dim=-1).contiguous()
+    router_logits = build_router_logits(token_counts, top_k, num_rows, num_experts)
+    full_weights = torch.softmax(router_logits, dim=-1)
+    topk_weights, topk_ids = torch.topk(full_weights, top_k, dim=-1)
+    topk_weights = (topk_weights / topk_weights.sum(dim=-1, keepdim=True)).contiguous()
+    topk_ids = topk_ids.contiguous()
 
     w13 = ((torch.randint(0, 256, (num_experts, 2 * inter_size, hidden_size // 2),
                           dtype=torch.uint8, device=DEVICE)) ^ 0x88).contiguous()
@@ -389,24 +416,27 @@ def setup_backend(name, num_experts, hidden_size, inter_size, group_size,
 
     w13_ipex = w13_scales_ipex = None
     w2_ipex = w2_scales_ipex = None
+    ipex_fusion = None
     rows_for_experts_ipex = None
     if name == "ipex_mxfp4":
+        import intel_extension_for_pytorch as ipex
+
         ipex_group_size = 32
         w13_ipex = torch.randint(
             0, 256,
-            (num_experts, hidden_size // 2, 2 * inter_size),
+            (num_experts, 2 * inter_size, hidden_size // 2),
             dtype=torch.uint8, device=DEVICE).contiguous()
         w13_scales_ipex = torch.randint(
             0, 256,
-            (num_experts, hidden_size // ipex_group_size, 2 * inter_size),
+            (num_experts, 2 * inter_size, hidden_size // ipex_group_size),
             dtype=torch.uint8, device=DEVICE).contiguous()
         w2_ipex = torch.randint(
             0, 256,
-            (num_experts, inter_size // 2, hidden_size),
+            (num_experts, hidden_size, inter_size // 2),
             dtype=torch.uint8, device=DEVICE).contiguous()
         w2_scales_ipex = torch.randint(
             0, 256,
-            (num_experts, inter_size // ipex_group_size, hidden_size),
+            (num_experts, hidden_size, inter_size // ipex_group_size),
             dtype=torch.uint8, device=DEVICE).contiguous()
         counts = torch.tensor(token_counts, dtype=torch.int32, device=DEVICE)
         rows_for_experts_ipex = counts.contiguous()
@@ -422,6 +452,17 @@ def setup_backend(name, num_experts, hidden_size, inter_size, group_size,
         w13_bias = None
         w2_bias = None
 
+    if name == "ipex_mxfp4":
+        ipex_fusion = ipex.llm.modules.GatedMLPMOE(
+            w13_ipex.view(torch.int32),
+            w2_ipex.view(torch.int32),
+            w1_scale_inv=w13_scales_ipex,
+            w2_scale_inv=w2_scales_ipex,
+            w13_bias=w13_bias,
+            w2_bias=w2_bias,
+            is_mxfp4=True,
+        )
+
     output = torch.empty_like(hidden_states)
 
     return env, {
@@ -429,6 +470,7 @@ def setup_backend(name, num_experts, hidden_size, inter_size, group_size,
         "w13": w13, "w13_scales": w13_scales, "w13_bias": w13_bias,
         "w2": w2, "w2_scales": w2_scales, "w2_bias": w2_bias,
         "topk_weights": topk_weights, "topk_ids": topk_ids,
+        "router_logits": router_logits,
         "num_experts": num_experts,
         "n_experts_per_token": top_k,
         "activation": activation,
@@ -437,6 +479,7 @@ def setup_backend(name, num_experts, hidden_size, inter_size, group_size,
         "rows_for_experts_ipex": rows_for_experts_ipex,
         "w13_ipex": w13_ipex, "w13_scales_ipex": w13_scales_ipex,
         "w2_ipex": w2_ipex, "w2_scales_ipex": w2_scales_ipex,
+        "ipex_fusion": ipex_fusion,
     }
 
 
@@ -459,24 +502,52 @@ def restore_env(saved):
             os.environ[k] = v
 
 
+def run_ipex_monolithic(kwargs):
+    activation = "swiglu_oai" if kwargs["activation"] == "swigluoai" else kwargs["activation"]
+    return kwargs["ipex_fusion"](
+        kwargs["hidden_states"],
+        False,
+        kwargs["n_experts_per_token"],
+        kwargs["router_logits"],
+        True,
+        None,
+        None,
+        activation=activation,
+    )
+
+
 # ---------------------------------------------------------------------------
 # Bench harness
 # ---------------------------------------------------------------------------
 
 def bench_backend(name, kwargs, warmup, iters, fuse_act_quant=False):
-    """Run instrumented xpu_fused_moe and collect per-thunk plus whole-block timings."""
     global THUNK_TIMING_ENABLED
+    if name == "ipex_mxfp4":
+        whole_times = []
+        for _ in range(warmup):
+            run_ipex_monolithic(kwargs)
+        for _ in range(iters):
+            torch.xpu.synchronize()
+            t0 = time.perf_counter()
+            run_ipex_monolithic(kwargs)
+            torch.xpu.synchronize()
+            whole_times.append((time.perf_counter() - t0) * 1e6)
+        sorted_whole = sorted(whole_times)
+        return {"whole_moe_wall": sorted_whole[len(sorted_whole) // 2]}
+
     THUNK_TIMES.clear()
+    fused_kwargs = {k: v for k, v in kwargs.items()
+                    if k not in ("router_logits", "ipex_fusion")}
 
     THUNK_TIMING_ENABLED = True
     for _ in range(warmup):
         fused_moe_instrumented(backend_label=name,
-                               fuse_act_quant=fuse_act_quant, **kwargs)
+                               fuse_act_quant=fuse_act_quant, **fused_kwargs)
     THUNK_TIMES.clear()
 
     for _ in range(iters):
         fused_moe_instrumented(backend_label=name,
-                               fuse_act_quant=fuse_act_quant, **kwargs)
+                               fuse_act_quant=fuse_act_quant, **fused_kwargs)
 
     medians = {}
     for region, times in THUNK_TIMES.items():
@@ -488,12 +559,12 @@ def bench_backend(name, kwargs, warmup, iters, fuse_act_quant=False):
     try:
         for _ in range(warmup):
             fused_moe_instrumented(backend_label=name,
-                                   fuse_act_quant=fuse_act_quant, **kwargs)
+                                   fuse_act_quant=fuse_act_quant, **fused_kwargs)
         for _ in range(iters):
             torch.xpu.synchronize()
             t0 = time.perf_counter()
             fused_moe_instrumented(backend_label=name,
-                                   fuse_act_quant=fuse_act_quant, **kwargs)
+                                   fuse_act_quant=fuse_act_quant, **fused_kwargs)
             torch.xpu.synchronize()
             whole_times.append((time.perf_counter() - t0) * 1e6)
     finally:
@@ -501,6 +572,75 @@ def bench_backend(name, kwargs, warmup, iters, fuse_act_quant=False):
     sorted_whole = sorted(whole_times)
     medians["whole_moe_wall"] = sorted_whole[len(sorted_whole) // 2]
     return medians
+
+
+# ---------------------------------------------------------------------------
+# Blob lane: production onednn_fused_moe_w4a8 single-dispatch path
+# ---------------------------------------------------------------------------
+
+def _median_stddev(samples):
+    sorted_s = sorted(samples)
+    median = sorted_s[len(sorted_s) // 2]
+    stddev = statistics.pstdev(samples) if len(samples) > 1 else 0.0
+    return median, stddev
+
+
+def _time_whole_wall(run_fn, warmup, iters):
+    for _ in range(warmup):
+        run_fn()
+    samples = []
+    for _ in range(iters):
+        torch.xpu.synchronize()
+        t0 = time.perf_counter()
+        run_fn()
+        torch.xpu.synchronize()
+        samples.append((time.perf_counter() - t0) * 1e6)
+    return samples
+
+
+def blob_gate_blockers(activation):
+    """Return reasons the production blob gate cannot be satisfied; empty means
+    dispatchable. Mirrors the VLLM_XPU_W4A8_FUSED_BLOB gate in
+    fused_moe_interface.xpu_fused_moe so the lane errors instead of silently
+    running the unfused path. Env conditions are forced by the caller.
+    """
+    reasons = []
+    if getattr(torch.ops._xpu_C, "onednn_fused_moe_w4a8", None) is None:
+        reasons.append(
+            "torch.ops._xpu_C.onednn_fused_moe_w4a8 op is not registered "
+            "(rebuild csrc with the fused-blob op)")
+    if getattr(torch.ops._moe_C,
+               "remap_and_quant_hidden_states_int8", None) is None:
+        reasons.append(
+            "torch.ops._moe_C.remap_and_quant_hidden_states_int8 op is not "
+            "registered (fused remap+quant required by blob gate)")
+    if getattr(torch.ops._C,
+               "swigluoai_and_mul_quant_int8_asym", None) is None:
+        reasons.append(
+            "torch.ops._C.swigluoai_and_mul_quant_int8_asym op is not "
+            "registered (fused act+quant required by blob gate)")
+    if activation != "swigluoai":
+        reasons.append(
+            f"activation={activation!r}; blob gate requires 'swigluoai' "
+            "(inter_scale must be 1)")
+    return reasons
+
+
+def make_blob_runner(kwargs):
+    from vllm_xpu_kernels.fused_moe_interface import xpu_fused_moe
+
+    def run():
+        xpu_fused_moe(
+            kwargs["hidden_states"],
+            kwargs["w13"], kwargs["w13_scales"], kwargs["w13_bias"],
+            kwargs["w2"], kwargs["w2_scales"], kwargs["w2_bias"],
+            kwargs["topk_weights"], kwargs["topk_ids"],
+            kwargs["n_experts_per_token"], kwargs["activation"],
+            kwargs["num_experts"],
+            output=kwargs["output"],
+            is_int4=kwargs["is_int4"], is_mxfp4=kwargs["is_mxfp4"])
+
+    return run
 
 
 def print_table(rows, header, footer_notes=()):
@@ -524,10 +664,10 @@ def main():
     parser.add_argument("--top-k", type=int, default=TOPK_DEFAULT)
     parser.add_argument("--num-experts", type=int, default=E_DEFAULT)
     parser.add_argument("--hidden", type=int, default=2944,
-                        help="hidden_size. Default=2944 matches TP4_GEMM1 K from roofline bench. "
+                        help="hidden_size. Default=2944 matches TP1_GEMM1 K from roofline bench. "
                              "(gpt-oss-120b is 2880; we use 2944 to keep group_size=128 divisible)")
-    parser.add_argument("--inter", type=int, default=768,
-                        help="per-rank inter_size for TP=4. Default = 768 to match TP4_GEMM1 N=1536, TP4_GEMM2 K=768")
+    parser.add_argument("--inter", type=int, default=3072,
+                        help="single-GPU inter_size for TP=1. Default=3072 to match TP1_GEMM1 N=6144, TP1_GEMM2 K=3072")
     parser.add_argument("--group-size", type=int, default=128)
     parser.add_argument("--activation", default="swigluoai",
                         choices=["silu", "swigluoai"])
@@ -541,6 +681,12 @@ def main():
         choices=BACKENDS)
     parser.add_argument("--warmup", type=int, default=10)
     parser.add_argument("--iters", type=int, default=30)
+    parser.add_argument(
+        "--blob", action="store_true",
+        help="Add a production fused-blob lane that drives onednn_fused_moe_w4a8 "
+             "via xpu_fused_moe with VLLM_XPU_W4A8_FUSED_BLOB=1. Single dispatch, "
+             "so only whole_moe_wall (median+stddev) is reported. Errors out "
+             "rather than silently falling back to the unfused path.")
     args = parser.parse_args()
 
     if args.num_tokens is None:
@@ -549,7 +695,7 @@ def main():
     has_bias = not args.no_bias
     print(f"\n{'=' * 100}")
     print(f"Fused MoE thunk benchmark — mode={args.mode}")
-    print(f"hidden={args.hidden} inter={args.inter} (per-rank, TP4) E={args.num_experts} "
+    print(f"hidden={args.hidden} inter={args.inter} (single-GPU, TP1) E={args.num_experts} "
           f"top_k={args.top_k} activation={args.activation} bias={'on' if has_bias else 'off'}")
     print(f"num_tokens={args.num_tokens} (M_total = num_tokens * top_k = {args.num_tokens * args.top_k})")
     print(f"{'=' * 100}\n")
@@ -581,6 +727,7 @@ def main():
     rows = []
     synced_regions = [r for r in region_order if r != "whole_moe_wall"]
     totals = {b: 0.0 for b in args.backends}
+    has_synced_total = {b: False for b in args.backends}
     for region in region_order:
         row = [region]
         for b in args.backends:
@@ -588,8 +735,12 @@ def main():
             row.append(f"{t:.1f}" if t is not None else "-")
             if t is not None and region in synced_regions:
                 totals[b] += t
+                has_synced_total[b] = True
         rows.append(row)
-    rows.append(["TOTAL_SYNCED_THUNKS"] + [f"{totals[b]:.1f}" for b in args.backends])
+    rows.append(["TOTAL_SYNCED_THUNKS"] + [
+        f"{totals[b]:.1f}" if has_synced_total[b] else "-"
+        for b in args.backends
+    ])
     print_table(rows, header)
 
     print()
@@ -606,6 +757,8 @@ def main():
         budget_postop = r.get("act", 0.0)
         budget_wrapper = r.get("pre_quant_g1", 0.0) + r.get("pre_quant_g2", 0.0)
         before = totals[b]
+        if before <= 0.0:
+            continue
         after_postop = before - budget_postop
         after_both = before - budget_postop - budget_wrapper
         print(f"[{b}]")
@@ -625,22 +778,82 @@ def main():
     ipex_keys = [b for b in args.backends if b.startswith("ipex")]
     onednn_keys = [b for b in args.backends if b.startswith("onednn")]
     if ipex_keys and onednn_keys:
-        print("=== oneDNN total-MoE-block vs ipex (with optimization projections) ===\n")
+        print("=== oneDNN whole-MoE-block vs ipex monolithic (with optimization projections) ===\n")
         for ik in ipex_keys:
-            it = totals[ik]
-            print(f"  Baseline {ik} synced TOTAL: {it:.1f} µs")
+            it = results[ik]["whole_moe_wall"]
+            print(f"  Baseline {ik} monolithic whole_moe_wall: {it:.1f} µs")
             for ok in onednn_keys:
                 ot = totals[ok]
+                ow = results[ok]["whole_moe_wall"]
                 budget_postop = results[ok].get("act", 0.0)
                 budget_wrapper = (results[ok].get("pre_quant_g1", 0.0) +
                                   results[ok].get("pre_quant_g2", 0.0))
                 op = ot - budget_postop
                 opb = op - budget_wrapper
-                print(f"    {ok:>14} now:         {ot:7.1f} µs ({ot - it:+7.1f} vs ipex)")
-                print(f"    {ok:>14} +PR#5134:    {op:7.1f} µs ({op - it:+7.1f} vs ipex)")
+                print(f"    {ok:>14} whole wall:   {ow:7.1f} µs ({ow - it:+7.1f} vs ipex)")
+                print(f"    {ok:>14} synced now:   {ot:7.1f} µs ({ot - it:+7.1f} vs ipex)")
+                print(f"    {ok:>14} +PR#5134:     {op:7.1f} µs ({op - it:+7.1f} vs ipex)")
                 if budget_wrapper > 0:
                     print(f"    {ok:>14} +PR#5134+T1: {opb:7.1f} µs ({opb - it:+7.1f} vs ipex)")
             print()
+
+    if args.blob:
+        run_blob_lane(args, has_bias)
+
+
+def run_blob_lane(args, has_bias):
+    print("=== Fused-blob lane (production onednn_fused_moe_w4a8, single dispatch) ===\n")
+    blockers = blob_gate_blockers(args.activation)
+    if blockers:
+        raise RuntimeError(
+            "Blob lane cannot dispatch the production fused path (refusing to "
+            "silently fall back to unfused):\n  - " + "\n  - ".join(blockers))
+
+    blob_env = {
+        "VLLM_XPU_GROUPED_GEMM_BACKEND": "onednn",
+        "VLLM_XPU_USE_W4A8": "1",
+        "VLLM_XPU_W4A8_FUSED_BLOB": "1",
+    }
+
+    lane_samples = {}
+
+    _, blob_kwargs = setup_backend(
+        "onednn_w4a8", args.num_experts, args.hidden, args.inter,
+        args.group_size, args.num_tokens, args.top_k,
+        args.activation, has_bias)
+    saved = apply_env(blob_env)
+    try:
+        lane_samples["onednn_w4a8_blob"] = _time_whole_wall(
+            make_blob_runner(blob_kwargs), args.warmup, args.iters)
+    finally:
+        restore_env(saved)
+
+    for ik in [b for b in args.backends if b.startswith("ipex")]:
+        env, kwargs = setup_backend(
+            ik, args.num_experts, args.hidden, args.inter,
+            args.group_size, args.num_tokens, args.top_k,
+            args.activation, has_bias)
+        saved = apply_env(env)
+        try:
+            lane_samples[ik] = _time_whole_wall(
+                lambda kw=kwargs: run_ipex_monolithic(kw),
+                args.warmup, args.iters)
+        finally:
+            restore_env(saved)
+
+    header = ["lane", "whole_moe_wall median (µs)", "stddev (µs)"]
+    rows = []
+    for lane, samples in lane_samples.items():
+        median, stddev = _median_stddev(samples)
+        rows.append([lane, f"{median:.1f}", f"{stddev:.1f}"])
+    print_table(rows, header)
+
+    blob_median, _ = _median_stddev(lane_samples["onednn_w4a8_blob"])
+    for ik in [b for b in args.backends if b.startswith("ipex")]:
+        ik_median, _ = _median_stddev(lane_samples[ik])
+        print(f"\n  onednn_w4a8_blob vs {ik}: "
+              f"{blob_median - ik_median:+.1f} µs "
+              f"({blob_median / ik_median:.2f}x)")
 
 
 if __name__ == "__main__":
