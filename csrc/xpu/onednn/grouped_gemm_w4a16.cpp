@@ -39,6 +39,12 @@ static inline bool message_contains(std::string_view haystack, std::string_view 
   return haystack.find(needle) != std::string_view::npos;
 }
 
+static inline bool token_centric_prefill_tune_enabled() {
+  auto val = vllm::xpu::getEnv("VLLM_XPU_ONEDNN_TOKEN_CENTRIC_PREFILL_TUNE");
+  if (!val.has_value()) return true;
+  return val.value() == "1" || val.value() == "true" || val.value() == "TRUE";
+}
+
 }  // namespace
 
 torch::Tensor grouped_gemm_w4a16(
@@ -182,10 +188,7 @@ torch::Tensor grouped_gemm_w4a16(
   cache_key.has_bias = has_bias ? 1 : 0;
   cache_key.max_expert_size = max_expert_size;
   cache_key.token_centric_prefill_tune =
-      vllm::xpu::env_flag_enabled(
-          "VLLM_XPU_ONEDNN_TOKEN_CENTRIC_PREFILL_TUNE")
-      ? 1
-      : 0;
+      token_centric_prefill_tune_enabled() ? 1 : 0;
 
   auto& primitive_cache = get_grouped_gemm_primitive_cache(device_id);
   auto iter = primitive_cache.find(cache_key);

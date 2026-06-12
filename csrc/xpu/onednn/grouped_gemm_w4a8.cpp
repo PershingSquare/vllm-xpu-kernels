@@ -74,12 +74,15 @@ static inline bool w4a8_profile_enabled() {
 }
 
 static inline bool w4a8_large_m_tile_enabled() {
-  return vllm::xpu::env_flag_enabled("VLLM_XPU_ONEDNN_W4A8_LARGE_M_TILE");
+  auto val = vllm::xpu::getEnv("VLLM_XPU_ONEDNN_W4A8_LARGE_M_TILE");
+  if (!val.has_value()) return true;  // default ON
+  return val.value() == "1" || val.value() == "true" || val.value() == "TRUE";
 }
 
 static inline bool token_centric_prefill_tune_enabled() {
-  return vllm::xpu::env_flag_enabled(
-      "VLLM_XPU_ONEDNN_TOKEN_CENTRIC_PREFILL_TUNE");
+  auto val = vllm::xpu::getEnv("VLLM_XPU_ONEDNN_TOKEN_CENTRIC_PREFILL_TUNE");
+  if (!val.has_value()) return true;  // default ON
+  return val.value() == "1" || val.value() == "true" || val.value() == "TRUE";
 }
 
 static inline uint64_t w4a8_profile_dump_every() {
