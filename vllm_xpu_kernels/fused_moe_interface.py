@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 import os
 import torch
+from dataclasses import dataclass
 
 try:
     from . import _C  # noqa: F401
@@ -57,6 +58,78 @@ class _W4A8ScratchPool:
 
 
 _w4a8_scratch = _W4A8ScratchPool()
+
+SWIGLUOAI_ALPHA = 1.702
+SWIGLUOAI_LIMIT = 7.0
+
+
+@dataclass(frozen=True)
+class _MoEFastPathPlan:
+    using_w4a8: bool
+    use_fused_remap_quant: bool
+    is_swigluoai: bool
+    inter_size_scale: int
+    act_quant_op: object
+    blob_op: object
+    use_blob: bool
+    can_fuse_act_quant: bool
+
+
+def _is_swigluoai_activation(activation) -> bool:
+    return activation == "swigluoai" or ("SWIGLUOAI" in str(activation))
+
+
+def _inter_size_scale_for_activation(activation) -> int:
+    return 2 if activation == "relu2_no_mul" else 1
+
+
+def _build_moe_fast_path_plan(using_w4a8: bool, activation: str, pool,
+                              fused_remap_quant_op):
+    is_swigluoai = _is_swigluoai_activation(activation)
+    inter_size_scale = _inter_size_scale_for_activation(activation)
+    act_quant_op = getattr(torch.ops._C,
+                           "swigluoai_and_mul_quant_int8_asym", None)
+    blob_op = getattr(torch.ops._xpu_C, "onednn_fused_moe_w4a8", None)
+    use_fused_remap_quant = (using_w4a8 and fused_remap_quant_op is not None)
+    blob_enabled = os.environ.get("VLLM_XPU_W4A8_FUSED_BLOB", "1") == "1"
+    use_blob = (blob_enabled and using_w4a8 and pool is not None
+                and use_fused_remap_quant and is_swigluoai
+                and inter_size_scale == 1 and act_quant_op is not None
+                and blob_op is not None)
+    can_fuse_act_quant = (using_w4a8 and is_swigluoai
+                          and inter_size_scale == 1
+                          and act_quant_op is not None)
+    return _MoEFastPathPlan(using_w4a8=using_w4a8,
+                            use_fused_remap_quant=use_fused_remap_quant,
+                            is_swigluoai=is_swigluoai,
+                            inter_size_scale=inter_size_scale,
+                            act_quant_op=act_quant_op,
+                            blob_op=blob_op,
+                            use_blob=use_blob,
+                            can_fuse_act_quant=can_fuse_act_quant)
+
+
+def _get_pooled_or_fresh(pool, name, shape, dtype, device):
+    if pool is not None:
+        return pool[name]
+    return torch.empty(shape, dtype=dtype, device=device)
+
+
+def _run_activation_op(activation, act_output, gemm1_output):
+    if activation == "silu":
+        torch.ops._C.silu_and_mul(act_output, gemm1_output)
+    elif activation == "gelu":
+        torch.ops._C.gelu_and_mul(act_output, gemm1_output)
+    elif _is_swigluoai_activation(activation):
+        torch.ops._C.swigluoai_and_mul(act_output, gemm1_output,
+                                       SWIGLUOAI_ALPHA, SWIGLUOAI_LIMIT)
+    elif activation == "relu2_no_mul":
+        torch.ops._C.relu2_no_mul(act_output, gemm1_output)
+    elif activation == "swiglustep":
+        torch.ops._C.swiglustep_and_mul(act_output, gemm1_output,
+                                        SWIGLUOAI_LIMIT)
+    else:
+        raise ValueError(f"Unsupported FusedMoe activation: {activation}.")
 
 
 def _use_w4a8() -> bool:
@@ -323,24 +396,13 @@ def xpu_fused_moe(hidden_states,
             dtype=torch.int32,
             device=hidden_states.device)
 
-    _remap_quant_op = getattr(torch.ops._moe_C,
-                              "remap_and_quant_hidden_states_int8", None)
-    _use_fused_remap_quant = (using_w4a8 and _remap_quant_op is not None)
+    remap_quant_op = getattr(torch.ops._moe_C,
+                             "remap_and_quant_hidden_states_int8", None)
+    fast_path = _build_moe_fast_path_plan(using_w4a8, activation, _pool,
+                                          remap_quant_op)
 
-    _is_swigluoai = (activation == "swigluoai" or
-                     ("SWIGLUOAI" in str(activation)))
-    _inter_scale = 2 if activation == "relu2_no_mul" else 1
-    _act_quant_op = getattr(torch.ops._C,
-                            "swigluoai_and_mul_quant_int8_asym", None)
-    _blob_op = getattr(torch.ops._xpu_C, "onednn_fused_moe_w4a8", None)
-    _blob_enabled = os.environ.get("VLLM_XPU_W4A8_FUSED_BLOB", "1") == "1"
-    _use_blob = (_blob_enabled and using_w4a8 and _pool is not None
-                 and _use_fused_remap_quant
-                 and _is_swigluoai and _inter_scale == 1
-                 and _act_quant_op is not None and _blob_op is not None)
-
-    if _use_blob:
-        _blob_op(
+    if fast_path.use_blob:
+        fast_path.blob_op(
             hidden_states, w13, gemm1_scales, w13_bias,
             w2, gemm2_scales, w2_bias,
             topk_weights, topk_ids, expert_map, output,
@@ -351,22 +413,22 @@ def xpu_fused_moe(hidden_states,
             expert_first_token_offset, _pool["offset_i32"],
             unpermuted_row_to_permuted_row,
             inter_size, hidden_size, num_experts, n_experts_per_token,
-            total_experts_num, 1.702, 7.0)
+            total_experts_num, SWIGLUOAI_ALPHA, SWIGLUOAI_LIMIT)
         return output
 
-    if _use_fused_remap_quant:
-        if _pool is not None:
-            A_q = _pool["a_q1"]
-            A_scale = _pool["a_scale1"]
-            A_zp = _pool["a_zp1"]
-        else:
-            A_q = torch.empty((num_moe_inputs, hidden_size),
-                              dtype=torch.uint8, device=hidden_states.device)
-            A_scale = torch.empty(num_moe_inputs, dtype=hidden_states.dtype,
-                                  device=hidden_states.device)
-            A_zp = torch.empty(num_moe_inputs, dtype=torch.uint8,
-                               device=hidden_states.device)
-        _remap_quant_op(
+    if fast_path.use_fused_remap_quant:
+        A_q = _get_pooled_or_fresh(_pool, "a_q1",
+                                   (num_moe_inputs, hidden_size),
+                                   torch.uint8, hidden_states.device)
+        A_scale = _get_pooled_or_fresh(_pool, "a_scale1",
+                                       num_moe_inputs,
+                                       hidden_states.dtype,
+                                       hidden_states.device)
+        A_zp = _get_pooled_or_fresh(_pool, "a_zp1",
+                                    num_moe_inputs,
+                                    torch.uint8,
+                                    hidden_states.device)
+        remap_quant_op(
             hidden_states=hidden_states,
             remapped_q=A_q,
             remapped_scale=A_scale,
@@ -409,7 +471,7 @@ def xpu_fused_moe(hidden_states,
     max_expert_size = (num_moe_inputs + n_experts_per_token - 1) // n_experts_per_token
 
     if using_w4a8:
-        if not _use_fused_remap_quant:
+        if not fast_path.use_fused_remap_quant:
             A_q, A_scale, A_zp = _dynamic_per_token_quant_int8(
                 remapped_hidden_states)
         torch.ops._xpu_C.onednn_grouped_gemm_w4a8(
@@ -432,36 +494,26 @@ def xpu_fused_moe(hidden_states,
             is_B_mxfp4=is_mxfp4,
             max_expert_size=max_expert_size)
 
-    inter_size_scale = 2 if activation == "relu2_no_mul" else 1
-    is_swigluoai = (activation == "swigluoai" or
-                    ("SWIGLUOAI" in str(activation)))
-    fused_act_quant_op = getattr(torch.ops._C,
-                                 "swigluoai_and_mul_quant_int8_asym", None)
-    can_fuse_act_quant = (using_w4a8 and is_swigluoai
-                          and inter_size_scale == 1
-                          and fused_act_quant_op is not None)
-
     input_B = w2
-    if _pool is not None:
-        gemm2_output = _pool["gemm2_output"]
-    else:
-        gemm2_output = torch.empty((num_moe_inputs, hidden_size),
-                                    dtype=hidden_states.dtype,
-                                    device=hidden_states.device)
+    gemm2_output = _get_pooled_or_fresh(_pool, "gemm2_output",
+                                        (num_moe_inputs, hidden_size),
+                                        hidden_states.dtype,
+                                        hidden_states.device)
 
-    if can_fuse_act_quant:
-        if _pool is not None:
-            A_q2 = _pool["a_q2"]
-            A_scale2 = _pool["a_scale2"]
-            A_zp2 = _pool["a_zp2"]
-        else:
-            A_q2 = torch.empty((num_moe_inputs, inter_size),
-                               dtype=torch.uint8, device=gemm1_output.device)
-            A_scale2 = torch.empty(num_moe_inputs, dtype=gemm1_output.dtype,
-                                   device=gemm1_output.device)
-            A_zp2 = torch.empty(num_moe_inputs, dtype=torch.uint8,
-                                device=gemm1_output.device)
-        fused_act_quant_op(A_q2, A_scale2, A_zp2, gemm1_output, 1.702, 7.0)
+    if fast_path.can_fuse_act_quant:
+        A_q2 = _get_pooled_or_fresh(_pool, "a_q2",
+                                    (num_moe_inputs, inter_size),
+                                    torch.uint8, gemm1_output.device)
+        A_scale2 = _get_pooled_or_fresh(_pool, "a_scale2",
+                                        num_moe_inputs,
+                                        gemm1_output.dtype,
+                                        gemm1_output.device)
+        A_zp2 = _get_pooled_or_fresh(_pool, "a_zp2",
+                                     num_moe_inputs,
+                                     torch.uint8,
+                                     gemm1_output.device)
+        fast_path.act_quant_op(A_q2, A_scale2, A_zp2, gemm1_output,
+                               SWIGLUOAI_ALPHA, SWIGLUOAI_LIMIT)
         torch.ops._xpu_C.onednn_grouped_gemm_w4a8(
             A_q2, A_scale2, A_zp2,
             input_B, gemm2_scales, w2_bias,
@@ -469,20 +521,9 @@ def xpu_fused_moe(hidden_states,
             hidden_size, inter_size, num_experts, max_expert_size)
     else:
         act_output = torch.empty(
-            (num_moe_inputs, inter_size * inter_size_scale),
+            (num_moe_inputs, inter_size * fast_path.inter_size_scale),
             dtype=gemm1_output.dtype, device=gemm1_output.device)
-        if activation == "silu":
-            torch.ops._C.silu_and_mul(act_output, gemm1_output)
-        elif activation == "gelu":
-            torch.ops._C.gelu_and_mul(act_output, gemm1_output)
-        elif is_swigluoai:
-            torch.ops._C.swigluoai_and_mul(act_output, gemm1_output, 1.702, 7.0)
-        elif activation == "relu2_no_mul":
-            torch.ops._C.relu2_no_mul(act_output, gemm1_output)
-        elif activation == "swiglustep":
-            torch.ops._C.swiglustep_and_mul(act_output, gemm1_output, 7.0)
-        else:
-            raise ValueError(f"Unsupported FusedMoe activation: {activation}.")
+        _run_activation_op(activation, act_output, gemm1_output)
         input_A = act_output.contiguous()
         if using_w4a8:
             A_q2, A_scale2, A_zp2 = _dynamic_per_token_quant_int8(input_A)
@@ -490,7 +531,7 @@ def xpu_fused_moe(hidden_states,
                 A_q2, A_scale2.reshape(-1), A_zp2.reshape(-1),
                 input_B, gemm2_scales, w2_bias,
                 gemm2_output, w4a8_expert_first_token_offset,
-                hidden_size, inter_size * inter_size_scale, num_experts, max_expert_size)
+                hidden_size, inter_size * fast_path.inter_size_scale, num_experts, max_expert_size)
         else:
             torch.ops._xpu_C.grouped_gemm_interface(
                 ptr_A=input_A,
@@ -500,7 +541,7 @@ def xpu_fused_moe(hidden_states,
                 ptr_D=gemm2_output,
                 expert_first_token_offset=expert_first_token_offset,
                 N=hidden_size,
-                K=inter_size * inter_size_scale,
+                K=inter_size * fast_path.inter_size_scale,
                 num_experts=num_experts,
                 is_B_int4=is_int4,
                 is_B_mxfp4=is_mxfp4,
