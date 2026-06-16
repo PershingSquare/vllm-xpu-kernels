@@ -186,7 +186,7 @@ def fused_moe_instrumented(
     rows_for_experts_ipex=None,
     w13_ipex=None, w13_scales_ipex=None,
     w2_ipex=None, w2_scales_ipex=None,
-    fuse_act_quant=False,
+    fuse_act_quant=True,
 ):
     """Production-shape MoE forward with thunk-region timing."""
     using_ipex = backend_label == "ipex_mxfp4"
@@ -520,7 +520,7 @@ def run_ipex_monolithic(kwargs):
 # Bench harness
 # ---------------------------------------------------------------------------
 
-def bench_backend(name, kwargs, warmup, iters, fuse_act_quant=False):
+def bench_backend(name, kwargs, warmup, iters, fuse_act_quant=True):
     global THUNK_TIMING_ENABLED
     if name == "ipex_mxfp4":
         whole_times = []
@@ -673,8 +673,8 @@ def main():
                         choices=["silu", "swigluoai"])
     parser.add_argument("--no-bias", action="store_true")
     parser.add_argument(
-        "--fuse-act-quant", action="store_true",
-        help="Use fused swigluoai_and_mul_quant_int8_asym op (oneDNN w4a8 + swigluoai only)")
+        "--no-fuse-act-quant", action="store_true",
+        help="Disable fused swigluoai_and_mul_quant_int8_asym and force separate act + quant in the benchmark")
     parser.add_argument(
         "--backends", nargs="+",
         default=BACKENDS,
@@ -716,7 +716,7 @@ def main():
         try:
             results[name] = bench_backend(
                 name, kwargs, args.warmup, args.iters,
-                fuse_act_quant=args.fuse_act_quant)
+                fuse_act_quant=not args.no_fuse_act_quant)
         finally:
             restore_env(saved)
 

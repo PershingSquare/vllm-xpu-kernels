@@ -93,6 +93,13 @@
 - Validation: `python -m py_compile benchmark/baseline_capture_noise_floor.py`
   and `git diff --check` both clean in-container.
 
+## 2026-06-12 20:20 Task: 15 — Large-M W4A8 microkernel tiling fix
+
+- Root cause confirmed: Task 15 had added in-kernel source zero-point correction to `grouped_gemm_w4a8_xe2.cl` (`sum_s8x4`, `weight_sum`, and `WITH_SRC_ZP` subtract). W4A8 source ZP is already handled before the oneDNN kernel by the host-side/remap quantization pipeline, so this double-applied the correction and caused the large-M flag path to fail parity.
+- Fix was surgical: removed only the kernel-local ZP correction machinery and kept the intended large-M changes (`W4A8_M_TILE` 4→8 under `W4A8_LARGE_M_TILE`, `acc1/iacc1`, rows 4-7 loads, and acc0/acc1 output selection). Also kept the dtype-aware `BIA_TO_REF` / `WEI_SCALES_TO_REF` usage and `MATH_UTILS_DECLARE_BF16` define.
+- Verification after rebuild in `hans-gpt-oss-ww17`: flag-OFF parity `48 passed in 3.10s`; flag-ON parity `48 passed in 2.82s`.
+- Blob prefill A/B was run as separate OFF/ON processes because this checkout's `benchmark_fused_moe_thunks.py` has no `--tp` or multi-token CLI. TP was mapped through `--inter` (TP4=768, TP8=384), warmup=30, iters=50. Results were mostly ties; TP8/tokens=2048 showed a cross-process threshold regression (OFF 1462.4us std 2.9 vs ON 1480.4us std 23.2, threshold 14.6us). Treat that as performance follow-up, not correctness blocker.
+
 ## Task 3 — Fused W4A8 MoE blob parity test (2026-06-11)
 
 - New test: `tests/test_fused_moe_w4a8_blob_onednn.py`. Drives the production
@@ -200,3 +207,78 @@
   0 regressions.
 - Parity: `pytest -q tests/test_fused_moe_w4a8_blob_onednn.py tests/test_grouped_gemm_w4a8_onednn.py`
   passed 48 tests (`evidence/task-13-parity.txt`).
+
+## Task 15 — Large-M W4A8 tile/unroll attempt did not land (2026-06-12)
+
+- Production default-off flag plumbing was added for `VLLM_XPU_ONEDNN_W4A8_LARGE_M_TILE`, including cache-key separation for same-process OFF/ON A/B. The cache bit was later narrowed to `total_M >= 1024` so decode/small-M descriptors do not split when the flag cannot affect strategy.
+- oneDNN gemmstone large-M Xe2 strategy was tested with `strat.unroll[1] = 64` behind the flag, then narrowed to `M() >= 1024`. Correctness passed in production mode: default-off `48 passed` and flag-on `48 passed` for `tests/test_fused_moe_w4a8_blob_onednn.py tests/test_grouped_gemm_w4a8_onednn.py`.
+- Same-process blob A/B did not produce a reliable prefill win. Clean rerun after cache-key narrowing showed all prefill configs were TIE and no decode regressions: TP4 2048 `+16.5us` vs threshold `1426.8us`, TP4 3072 `+2.6us` vs `3982.4us`, TP8 2048 `-2.7us` vs `61.6us`, TP8 3072 `-26.8us` vs `44.0us`.
+- Forced hand-written Xe2 W4A8 path (`GRPGEMM_W4A8_XE2_KERNEL=1 VLLM_XPU_ONEDNN_W4A8_LARGE_M_TILE=1`) still failed parity badly: 48/48 W4A8 tests failed with large tensor mismatches, so it must remain out of production/default flag behavior.
+- Do not commit the Task 15 tuning as a performance win. The safe pieces are correctness-preserving/default-off, but the required A/B win rule was not met after three approaches: gemmstone unroll64, large-M/cache gating, and forced hand Xe2 kernel.
+
+## [2026-06-12 20:30] Task: 16 — TP4 acceptance sweep
+- Ran full A/B at TP4 with all validated flags ON
+  (VLLM_XPU_ONEDNN_TOKEN_CENTRIC_PREFILL_TUNE=1, VLLM_XPU_ONEDNN_W4A8_LARGE_M_TILE=1)
+  via baseline_capture_noise_floor.py --tp 4 --runs 2 --warmup 30 --iters 50.
+  Same-process blob-vs-ipex delta (avoids ~10-13us tiny-M cross-invocation drift).
+- Result: 34 configs (decode 1..32 + prefill 2048,3072): 27 BLOB_WIN, 7 TIE,
+  **0 BLOB_LOSS**. DECODE PARITY HOLDS at every integer token count 1..32.
+- Prefill non-regression: blob ~2.1x (2048: 2217.7 vs 4650.2us) and ~2.3x
+  (3072: 2845.3 vs 6467.7us) faster than IPEX; blob medians within Task-7 nf.
+- Worst decode config = tokens=9 (only point where blob_med > ipex_med, delta
+  -1.8us << win_thr 7.5us = TIE). High-runs confirm (--runs 6): delta flips to
+  +1.1us, still TIE. M=9 blob/ipex are statistically indistinguishable; never
+  near a BLOB_LOSS. tokens=13 firmed to BLOB_WIN at 6 runs.
+- blob lane non-regression vs Task-7 (flags OFF): all blob-ON medians within
+  baseline noise floor / known tiny-M drift; tokens=7,10 marginally above own nf
+  (+11.4/+12.0) but inside documented ~10-13us drift and decisive A/B wins.
+- Evidence: .omo/evidence/task-16-tp4-acceptance.md (full table + verdicts),
+  .omo/evidence/task-16-tp4-worst-case.md (worst-case analysis).
+
+## [2026-06-12] Task: 18 — No-regression validation (all validated flags ON)
+- All validated flags ON: VLLM_XPU_ONEDNN_TOKEN_CENTRIC_PREFILL_TUNE=1 +
+  VLLM_XPU_ONEDNN_W4A8_LARGE_M_TILE=1 (both stay default-OFF in build; only
+  measured, not flipped). Wave 2 opts baked into build.
+- CORRECTNESS (flags ON): the 3 files pass — `pytest -q
+  test_grouped_gemm_w4a8_onednn.py test_grouped_gemm_w4a16_onednn.py
+  test_fused_moe_w4a8_blob_onednn.py` => 54 passed in 11.81s. This covers
+  bias{off,on} x dtype{fp16,bf16} x gs{128,256}/{64,128} in one shot — axes 3/4/5
+  are correctness-only and need no separate benchmark. bf16+gs256 isolated
+  evidence: evidence/task-18-bf16-g256.txt (4 bf16+gs256 + 24 bf16 total pass).
+- PERF no-regression (blob whole_moe_wall, OFF vs ON, same task-7 rule with
+  OFF_run_to_run_delta folded into threshold): 8/8 TIE. prefill TP4/TP8 2048+3072
+  + TP1 decode{1,4,8} + TP1 prefill 2048. Evidence: evidence/task-18-no-regression.md.
+  Driver: .omo/scripts/task18_noregression.py (TP mapped via --inter 768/384/3072
+  since this checkout's benchmark_fused_moe_thunks.py has single --num-tokens, no --tp).
+- KEY NOISE LESSON: REPS=2 is NOT enough for blob whole-wall on this box. The
+  first pass flagged prefill TP8 2048+3072 as REGRESSION, but the ON run pairs
+  were `[1540,2751]` and `[4356,1909]` — one clean run matching OFF (1909.8 vs
+  OFF 1911.8) + one wild outlier. The SAME transient GPU contention also blew up
+  OFF runs of TP1 decode 4/8 (OFF `[446,1605]`, `[516,1628]`), proving it's
+  process/device contention, not a flag effect. A 2-run median averages the
+  outlier in. REPS=5 (median rejects 1-2 outliers) -> all 4 confirm TIE
+  (TP8 3072 ON median 1908.7 actually < OFF 1911.8). RULE: for blob A/B always
+  REPS>=5 and use median-of-medians; do not trust a 2-rep REGRESSION before
+  re-running with more reps. Within-run iter stddev can spike from unrelated
+  contention; use run-to-run dispersion of medians for the noise floor instead.
+
+## [2026-06-12 20:35] Task: 17 — TP8 acceptance sweep
+- Rebuild required first: build/temp .so was mid-write ("file too short") + uncommitted
+  csrc/xpu/onednn/grouped_gemm_w4a8.cpp change (gate w4a8_large_m_tile to total_M>=1024 so
+  decode small-M is untouched). Rebuilt `pip install --no-build-isolation -e .` (exit 0)
+  so the .so matches source before benchmarking.
+- Full TP8 A/B (decode 1..32 + prefill {2048,3072} = 34 configs), warmup=30 iters=50 runs=2.
+  FLAGS ON (TOKEN_CENTRIC_PREFILL_TUNE=1, W4A8_LARGE_M_TILE=1):
+    BLOB_WIN 15, BLOB_LOSS 0, TIE 19. delta(ipex-blob) POSITIVE at ALL 34 configs.
+  => DECODE PARITY PASS (32/32), PREFILL NON-REGRESSION PASS (2/2). All 68 lanes reproducible=YES.
+- Worst decode config = tokens=28: blob 241.2us vs ipex 242.0us, delta +0.8us, TIE -> PASS.
+  No config where blob is slower (no BLOB_LOSS). Thin-margin band is M~26-30.
+- FLAGS OFF reference: BLOB_WIN 11, BLOB_LOSS 1, TIE 22. The single loss (tokens=27, blob
+  270.1us blob_std 113.1us vs ipex 233.5us, -36.6us) is a COLD-ITER NOISE ARTIFACT
+  (blob stddev 113 >> 36.6 gap). With flags ON same config is clean TIE (234.1us, std 11.1,
+  +4.8us, reproducible). => validated flags eliminate the only flags-OFF anomaly; no regression.
+- Confirms Task-7 inherited wisdom: IPEX cold-iter stddev can blow noise floors to 400-900us at
+  random configs, turning real blob wins into TIE. Use same-process delta + the median; the
+  blob median is faster in every decode config at TP8.
+- Evidence: .omo/evidence/task-17-tp8-acceptance.md, task-17-tp8-worst-case.md.
+  Raw: container /tmp/task17_flags_on.md, task17_flags_off.md, *_repro.txt, *_run.log.

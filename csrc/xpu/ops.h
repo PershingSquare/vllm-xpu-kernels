@@ -66,6 +66,20 @@ torch::Tensor grouped_gemm_interface(
     bool is_B_mxfp4,
     int64_t max_expert_size);
 
+torch::Tensor lean_grouped_gemm_w4a8(
+    torch::Tensor A_q,
+    torch::Tensor A_scale,
+    torch::Tensor A_zp,
+    torch::Tensor B_packed_u4,
+    torch::Tensor B_scales,
+    const c10::optional<at::Tensor>& bias,
+    torch::Tensor D,
+    torch::Tensor expert_first_token_offset,
+    int64_t N,
+    int64_t K,
+    int64_t num_experts,
+    int64_t max_expert_size);
+
 std::tuple<at::Tensor, at::Tensor> deepseek_scaling_rope(
     const at::Tensor& positions,
     const at::Tensor& query,

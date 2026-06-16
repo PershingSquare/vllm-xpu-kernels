@@ -5,6 +5,7 @@
 #include "xpu/onednn/grouped_gemm_w4a16.h"
 #include "xpu/onednn/grouped_gemm_w4a8.h"
 #include "xpu/onednn/onednn_grouped_gemm_cache.h"
+#include "xpu/onednn/sycl_grouped_gemm_w4a8.h"
 
 #include <torch/library.h>
 #include <torch/version.h>
@@ -69,6 +70,14 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, xpu_ops) {
       "int N, int K, int num_experts, int max_expert_size) -> Tensor");
   xpu_ops.impl(
       "onednn_grouped_gemm_w4a8", torch::kXPU, &oneDNN::grouped_gemm_w4a8);
+
+  xpu_ops.def(
+      "lean_grouped_gemm_w4a8(Tensor A_q, Tensor A_scale, Tensor A_zp, "
+      "Tensor B_packed_u4, Tensor B_scales, Tensor? bias, Tensor D, "
+      "Tensor expert_first_token_offset, "
+      "int N, int K, int num_experts, int max_expert_size) -> Tensor");
+  xpu_ops.impl(
+      "lean_grouped_gemm_w4a8", torch::kXPU, &oneDNN::lean_grouped_gemm_w4a8);
 
   xpu_ops.def(
       "onednn_fused_moe_w4a8(Tensor hidden_states, Tensor w13, "

@@ -3,6 +3,7 @@
 #include "utils.h"
 #include "xpu/onednn/onednn_grouped_gemm_cache.h"
 #include "xpu/onednn/onednn_runtime.h"
+#include "xpu/onednn/sycl_grouped_gemm_w4a8.h"
 
 #include <atomic>
 #include <chrono>
@@ -330,6 +331,14 @@ torch::Tensor grouped_gemm_w4a8(
   TORCH_CHECK((N % 2) == 0, "N must be even for int4 weights");
   TORCH_CHECK(total_M <= std::numeric_limits<int>::max(), "total_M exceeds int32 range");
 
+  // Lean SYCL path: bypass oneDNN dispatch for small-M decode
+  if (lean_sycl_w4a8_enabled() &&
+      total_M <= LEAN_SYCL_W4A8_THRESHOLD) {
+    return lean_grouped_gemm_w4a8(
+        A_q, A_scale, A_zp, B_packed_u4, B_scales,
+        bias, D, expert_first_token_offset,
+        N, K, num_experts, max_expert_size);
+  }
 
   const bool per_row_A_scale =
       (A_scale.dim() == 1 && A_scale.size(0) == total_M) ||
