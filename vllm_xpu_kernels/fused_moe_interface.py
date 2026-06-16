@@ -438,7 +438,8 @@ def xpu_fused_moe(hidden_states,
             unpermuted_row_to_permuted_row=unpermuted_row_to_permuted_row,
             topk_ids=topk_ids,
             total_experts_num=total_experts_num,
-            local_experts_num=local_experts_num)
+            local_experts_num=local_experts_num,
+            expert_first_token_offset_i32=_pool["offset_i32"])
     else:
         remapped_hidden_states = torch.empty(
             (num_rows * n_experts_per_token, hidden_size),
@@ -459,7 +460,8 @@ def xpu_fused_moe(hidden_states,
     if using_w4a8:
         if _pool is not None:
             w4a8_expert_first_token_offset = _pool["offset_i32"]
-            w4a8_expert_first_token_offset.copy_(expert_first_token_offset)
+            if not fast_path.use_fused_remap_quant:
+                w4a8_expert_first_token_offset.copy_(expert_first_token_offset)
         else:
             w4a8_expert_first_token_offset = expert_first_token_offset.to(
                 torch.int32)

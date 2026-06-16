@@ -76,9 +76,12 @@ class RowsPerExpertCount {
 class CalculateFristTokenOffset {
  public:
   CalculateFristTokenOffset(
-      int64_t* expert_first_token_offset, const int local_experts_num)
+      int64_t* expert_first_token_offset,
+      const int local_experts_num,
+      int32_t* expert_first_token_offset_i32 = nullptr)
       : expert_first_token_offset(expert_first_token_offset),
-        local_experts_num(local_experts_num) {}
+        local_experts_num(local_experts_num),
+        expert_first_token_offset_i32(expert_first_token_offset_i32) {}
 
   static constexpr int WARP_SIZE = 32;
   static constexpr int MAX_LOCAL_STORAGE = 32;
@@ -116,12 +119,20 @@ class CalculateFristTokenOffset {
     int global_sum =
         sycl::exclusive_scan_over_group(sg, local_sum, sycl::plus<int>());
 
+    if (expert_first_token_offset_i32 != nullptr && sg_local_id == 0) {
+      expert_first_token_offset_i32[0] = 0;
+    }
+
     if (remained_elems > 0) {
 #pragma unroll
       for (int i = 0; i < local_elems; ++i) {
         int idx = local_start + i;
         global_sum += local_storage[i];
         expert_first_token_offset[idx + 1] = global_sum;
+        if (expert_first_token_offset_i32 != nullptr) {
+          expert_first_token_offset_i32[idx + 1] =
+              static_cast<int32_t>(global_sum);
+        }
       }
     }
   }
@@ -129,6 +140,7 @@ class CalculateFristTokenOffset {
  private:
   int64_t* expert_first_token_offset;
   const int local_experts_num;
+  int32_t* expert_first_token_offset_i32;
 };
 
 template <typename TA, typename TS, int TopK>
@@ -556,6 +568,7 @@ void RemapAndQuantInt8AsymLauncher(
     uint8_t* remapped_zp,
     int* expert_map,
     int64_t* expert_first_token_offset,
+    int32_t* expert_first_token_offset_i32,
     int* unpermuted_row_to_permuted_row,
     int64_t* topk_ids,
     int const num_rows,
@@ -582,7 +595,10 @@ void RemapAndQuantInt8AsymLauncher(
   queue.submit([&](sycl::handler& cgh) {
     cgh.parallel_for(
         CalculateFristTokenOffset::get_nd_range(),
-        CalculateFristTokenOffset{expert_first_token_offset, local_experts_num});
+        CalculateFristTokenOffset{
+            expert_first_token_offset,
+            local_experts_num,
+            expert_first_token_offset_i32});
   });
 
   queue.submit([&](sycl::handler& cgh) {
@@ -609,7 +625,8 @@ void remap_and_quant_hidden_states_int8(
     torch::Tensor& unpermuted_row_to_permuted_row,
     torch::Tensor& topk_ids,
     int64_t total_experts_num,
-    int64_t local_experts_num) {
+    int64_t local_experts_num,
+    c10::optional<torch::Tensor> const& expert_first_token_offset_i32) {
   TORCH_CHECK(
       hidden_states.scalar_type() == torch::kFloat16 ||
           hidden_states.scalar_type() == torch::kBFloat16,
@@ -619,6 +636,15 @@ void remap_and_quant_hidden_states_int8(
       remapped_scale.scalar_type() == hidden_states.scalar_type(),
       "remapped_scale dtype must match hidden_states");
   TORCH_CHECK(remapped_zp.scalar_type() == torch::kByte, "remapped_zp must be uint8");
+
+  if (expert_first_token_offset_i32.has_value()) {
+    TORCH_CHECK(
+        expert_first_token_offset_i32->scalar_type() == torch::kInt32,
+        "expert_first_token_offset_i32 must be int32");
+    TORCH_CHECK(
+        expert_first_token_offset_i32->is_contiguous(),
+        "expert_first_token_offset_i32 must be contiguous");
+  }
 
   int const num_rows = hidden_states.size(0);
   int const hidden_size = hidden_states.size(1);
@@ -634,6 +660,11 @@ void remap_and_quant_hidden_states_int8(
   TORCH_CHECK(
       remapped_zp.numel() == num_rows * TopK,
       "remapped_zp must have num_rows*TopK elements");
+  if (expert_first_token_offset_i32.has_value()) {
+    TORCH_CHECK(
+        expert_first_token_offset_i32->size(0) == local_experts_num + 1,
+        "expert_first_token_offset_i32 must be [local_experts_num + 1]");
+  }
 
   const at::DeviceGuard device_guard(hidden_states.device());
   auto& queue = vllm::xpu::vllmGetQueue();
@@ -647,6 +678,9 @@ void remap_and_quant_hidden_states_int8(
       expert_map.has_value()                                                \
           ? reinterpret_cast<int*>(expert_map->data_ptr()) : nullptr,       \
       reinterpret_cast<int64_t*>(expert_first_token_offset.data_ptr()),     \
+      expert_first_token_offset_i32.has_value()                             \
+          ? reinterpret_cast<int32_t*>(expert_first_token_offset_i32->data_ptr()) \
+          : nullptr,                                                        \
       reinterpret_cast<int*>(unpermuted_row_to_permuted_row.data_ptr()),    \
       reinterpret_cast<int64_t*>(topk_ids.data_ptr()),                      \
       num_rows, hidden_size, total_experts_num, local_experts_num, queue)

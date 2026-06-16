@@ -121,4 +121,5 @@ void remap_and_quant_hidden_states_int8(
     torch::Tensor& unpermuted_row_to_permuted_row,
     torch::Tensor& topk_ids,
     int64_t total_experts_num,
-    int64_t local_experts_num);
+    int64_t local_experts_num,
+    c10::optional<torch::Tensor> const& expert_first_token_offset_i32);

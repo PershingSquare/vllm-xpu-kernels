@@ -111,8 +111,18 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, m) {
       "Tensor hidden_states, Tensor remapped_q, Tensor remapped_scale, "
       "Tensor remapped_zp, Tensor? expert_map, "
       "Tensor expert_first_token_offset, Tensor unpermuted_row_to_permuted_row, "
-      "Tensor topk_ids, int total_experts_num, int local_experts_num) -> ()");
+      "Tensor topk_ids, int total_experts_num, int local_experts_num, "
+      "Tensor? expert_first_token_offset_i32=None) -> ()");
   m.impl("remap_and_quant_hidden_states_int8", torch::kXPU,
+         &remap_and_quant_hidden_states_int8);
+  m.def(
+      "remap_and_asym_quant_hidden_states_int8("
+      "Tensor hidden_states, Tensor remapped_q, Tensor remapped_scale, "
+      "Tensor remapped_zp, Tensor? expert_map, "
+      "Tensor expert_first_token_offset, Tensor unpermuted_row_to_permuted_row, "
+      "Tensor topk_ids, int total_experts_num, int local_experts_num, "
+      "Tensor? expert_first_token_offset_i32=None) -> ()");
+  m.impl("remap_and_asym_quant_hidden_states_int8", torch::kXPU,
          &remap_and_quant_hidden_states_int8);
 }
 

@@ -226,6 +226,72 @@ def test_remap_hidden_states(num_rows, hidden_size, total_experts_num, topk,
             print("Mismatched ref:", ref_unpermuted_scales[mismatched_indices])
 
 
+@pytest.mark.parametrize("num_rows", [32])
+@pytest.mark.parametrize("hidden_size", [128])
+@pytest.mark.parametrize("total_experts_num", [16])
+@pytest.mark.parametrize("topk", [1, 8])
+def test_remap_and_quant_hidden_states_int8_emits_i32_offsets(
+        num_rows, hidden_size, total_experts_num, topk):
+    seed_everything(7)
+
+    hidden_states = torch.randn((num_rows, hidden_size),
+                                dtype=torch.bfloat16,
+                                device=DEVICE)
+    remapped_q = torch.empty((num_rows * topk, hidden_size),
+                             dtype=torch.uint8,
+                             device=DEVICE)
+    remapped_scale = torch.empty(num_rows * topk,
+                                 dtype=hidden_states.dtype,
+                                 device=DEVICE)
+    remapped_zp = torch.empty(num_rows * topk,
+                              dtype=torch.uint8,
+                              device=DEVICE)
+    expert_first_token_offset = torch.zeros((total_experts_num + 1),
+                                            dtype=torch.int64,
+                                            device=DEVICE)
+    expert_first_token_offset_i32 = torch.empty((total_experts_num + 1),
+                                                dtype=torch.int32,
+                                                device=DEVICE)
+    unpermuted_row_to_permuted_row = torch.empty((num_rows, topk),
+                                                 dtype=torch.int32,
+                                                 device=DEVICE)
+
+    scores = torch.randn((num_rows, total_experts_num),
+                         device=DEVICE,
+                         dtype=torch.float32)
+    _, topk_ids = torch.topk(scores, k=topk, dim=-1, sorted=False)
+    topk_ids = topk_ids.to(torch.int64)
+
+    torch.ops._moe_C.remap_and_quant_hidden_states_int8(
+        hidden_states, remapped_q, remapped_scale, remapped_zp, None,
+        expert_first_token_offset, unpermuted_row_to_permuted_row, topk_ids,
+        total_experts_num, total_experts_num, expert_first_token_offset_i32)
+
+    torch.testing.assert_close(expert_first_token_offset_i32,
+                               expert_first_token_offset.to(torch.int32),
+                               rtol=0,
+                               atol=0)
+
+    expert_first_token_offset_without_i32 = torch.zeros(
+        (total_experts_num + 1), dtype=torch.int64, device=DEVICE)
+    unpermuted_row_to_permuted_row_without_i32 = torch.empty(
+        (num_rows, topk), dtype=torch.int32, device=DEVICE)
+    remapped_q_without_i32 = torch.empty_like(remapped_q)
+    remapped_scale_without_i32 = torch.empty_like(remapped_scale)
+    remapped_zp_without_i32 = torch.empty_like(remapped_zp)
+
+    torch.ops._moe_C.remap_and_quant_hidden_states_int8(
+        hidden_states, remapped_q_without_i32, remapped_scale_without_i32,
+        remapped_zp_without_i32, None, expert_first_token_offset_without_i32,
+        unpermuted_row_to_permuted_row_without_i32, topk_ids,
+        total_experts_num, total_experts_num)
+
+    torch.testing.assert_close(expert_first_token_offset_without_i32,
+                               expert_first_token_offset,
+                               rtol=0,
+                               atol=0)
+
+
 @pytest.mark.parametrize("num_rows", [262144])
 @pytest.mark.parametrize("hidden_size", [2048])
 @pytest.mark.parametrize("total_experts_num", [128])
